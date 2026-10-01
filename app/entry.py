@@ -2,7 +2,7 @@ import argparse
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from app.config import tenant_header
-from app.store import orders, refunds, settlements
+from app.store import orders, reconciliations, refunds, settlements
 from app.store.db import connect, migrate
 from app.rules import order_rules
 
@@ -29,6 +29,11 @@ class SettlementIn(BaseModel):
     amount_cents: int = Field(gt=0)
     refund_ids: list[str] = Field(min_length=1)
     reason: str = Field(default="")
+
+class ReconciliationIn(BaseModel):
+    batch_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    note: str = Field(default="")
 
 @app.get("/health")
 def health() -> dict:
@@ -142,6 +147,26 @@ def revoke_settlement(settlement_id: str, x_tenant: str = Header(default=""),
         raise HTTPException(status_code=400, detail="idempotency-key header is required")
     outcome = settlements.revoke(x_tenant, settlement_id, idempotency_key)
     return _render(outcome)
+
+@app.post("/reconciliations", status_code=201)
+def create_reconciliation(body: ReconciliationIn, x_tenant: str = Header(default=""),
+                          idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = reconciliations.execute(x_tenant, body.batch_id, body.order_id,
+                                      body.note, idempotency_key)
+    return _render(outcome)
+
+@app.get("/reconciliations/{batch_id}")
+def read_reconciliation(batch_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    batch = reconciliations.get(x_tenant, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="reconciliation batch not found")
+    return batch
 
 def _render(outcome) -> dict:
     if outcome.code != "ok":
