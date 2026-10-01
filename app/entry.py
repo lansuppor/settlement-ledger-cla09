@@ -133,6 +133,16 @@ def advance_settlement(settlement_id: str, x_tenant: str = Header(default=""),
     outcome = settlements.advance(x_tenant, settlement_id, idempotency_key)
     return _render(outcome)
 
+@app.post("/settlements/{settlement_id}/revoke", status_code=200)
+def revoke_settlement(settlement_id: str, x_tenant: str = Header(default=""),
+                      idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = settlements.revoke(x_tenant, settlement_id, idempotency_key)
+    return _render(outcome)
+
 def _render(outcome) -> dict:
     if outcome.code != "ok":
         raise HTTPException(status_code=outcome.status, detail=outcome.detail)

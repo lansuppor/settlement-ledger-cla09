@@ -5,9 +5,10 @@ from app.store.idempotency import lookup_replay, now_iso, record_and_finish, sto
 from app.store.outcome import Outcome
 from app.store.refunds import EFFECTIVE, PENDING, REVERSED
 
-# Settlement lifecycle: pending -> effective (terminal).
+# Settlement lifecycle: pending -> effective -> revoked (terminal).
 PENDING_SETTLEMENT = "pending"
 EFFECTIVE_SETTLEMENT = "effective"
+REVOKED_SETTLEMENT = "revoked"
 
 # Distinguishable error classes (mirrors the refund store's convention).
 NOT_FOUND = "not_found"
@@ -15,12 +16,16 @@ CONFLICT = "conflict"
 INVALID_AMOUNT = "invalid_amount"
 INVALID_REFUNDS = "invalid_refunds"
 ALREADY_ADVANCED = "already_advanced"
+ALREADY_REVOKED = "already_revoked"
+NOT_REVOCABLE = "settlement_not_effective"
+SETTLEMENT_REVOKED = "settlement_revoked"
 REFUND_REVERSED = "refund_reversed"
 REFUND_ALREADY_SETTLED = "refund_already_settled"
 AMOUNT_MISMATCH = "amount_mismatch"
 
 ACCEPT_OP = "settle_accept"
 ADVANCE_OP = "settle_advance"
+REVOKE_OP = "settle_revoke"
 
 
 def _row_to_body(row: sqlite3.Row, refund_ids: list[str]) -> dict:
@@ -182,6 +187,13 @@ def advance(tenant: str, settlement_id: str, fingerprint: str) -> Outcome:
                 detail="settlement already advanced",
             )
 
+        if row["status"] == REVOKED_SETTLEMENT:
+            return record_and_finish(
+                conn, tenant=tenant, operation=ADVANCE_OP, target_id=settlement_id,
+                fingerprint=fingerprint, status=409, code=SETTLEMENT_REVOKED,
+                detail="settlement already revoked",
+            )
+
         refund_ids = _load_refund_ids(conn, tenant, settlement_id)
 
         # Validate every reference first; the first breach wins and the whole
@@ -264,3 +276,87 @@ def _fail(conn: sqlite3.Connection, tenant: str, settlement_id: str, fingerprint
         conn, tenant=tenant, operation=ADVANCE_OP, target_id=settlement_id,
         fingerprint=fingerprint, status=status, code=code, detail=detail,
     )
+
+
+def revoke(tenant: str, settlement_id: str, fingerprint: str) -> Outcome:
+    """Atomically revoke an effective settlement.
+
+    The settlement enters the terminal ``revoked`` state while every claim it
+    holds is released and each still-effective referenced refund returns to
+    pending — all in one transaction, so the settlement and its claims are
+    either all released or all left untouched. Revocation only undoes the
+    claim relationship: refunds that were independently reversed afterwards
+    keep their own status (the status=effective flip guard leaves them alone).
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        replay = lookup_replay(conn, tenant, REVOKE_OP, settlement_id, fingerprint)
+        if replay is not None:
+            conn.execute("COMMIT")
+            return replay
+
+        row = conn.execute(
+            "SELECT order_id, amount_cents, reason, status, created_at, updated_at "
+            "FROM settlements WHERE tenant=? AND settlement_id=?",
+            (tenant, settlement_id),
+        ).fetchone()
+        if row is None:
+            return record_and_finish(
+                conn, tenant=tenant, operation=REVOKE_OP, target_id=settlement_id,
+                fingerprint=fingerprint, status=404, code=NOT_FOUND,
+                detail="settlement not found",
+            )
+
+        if row["status"] == REVOKED_SETTLEMENT:
+            return record_and_finish(
+                conn, tenant=tenant, operation=REVOKE_OP, target_id=settlement_id,
+                fingerprint=fingerprint, status=409, code=ALREADY_REVOKED,
+                detail="settlement already revoked",
+            )
+
+        # Only an effective settlement can be revoked; a pending one has no
+        # claims to release and must be rejected without any state change.
+        if row["status"] != EFFECTIVE_SETTLEMENT:
+            return record_and_finish(
+                conn, tenant=tenant, operation=REVOKE_OP, target_id=settlement_id,
+                fingerprint=fingerprint, status=409, code=NOT_REVOCABLE,
+                detail="settlement is not effective",
+            )
+
+        refund_ids = _load_refund_ids(conn, tenant, settlement_id)
+
+        ts = now_iso()
+        # Release the hard uniqueness claims first so other pending
+        # settlements can re-claim the refunds, then flip only refunds that
+        # are still effective back to pending, then terminalize the settlement.
+        conn.execute(
+            "DELETE FROM settlement_claims WHERE tenant=? AND settlement_id=?",
+            (tenant, settlement_id),
+        )
+        conn.executemany(
+            "UPDATE refunds SET status=? WHERE tenant=? AND refund_id=? AND status=?",
+            [(PENDING, tenant, refund_id, EFFECTIVE) for refund_id in refund_ids],
+        )
+        conn.execute(
+            "UPDATE settlements SET status=?, updated_at=? WHERE tenant=? AND settlement_id=?",
+            (REVOKED_SETTLEMENT, ts, tenant, settlement_id),
+        )
+        body = {
+            "settlement_id": settlement_id,
+            "order_id": row["order_id"],
+            "amount_cents": row["amount_cents"],
+            "reason": row["reason"],
+            "refund_ids": refund_ids,
+            "status": REVOKED_SETTLEMENT,
+            "created_at": row["created_at"],
+            "updated_at": ts,
+        }
+        store_outcome(conn, tenant=tenant, operation=REVOKE_OP, target_id=settlement_id,
+                      fingerprint=fingerprint, code="ok", status=200, detail="",
+                      body=body)
+        conn.execute("COMMIT")
+        return Outcome.ok(body)
+    finally:
+        conn.close()
