@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；退款单的受理、读取、冲正与幂等重放；以及结算单的受理、读取、推进（把引用的待处理退款原子推进为已生效）与撤销（解除已生效结算单的全部核销，退款回到待处理）。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；退款单的受理、读取、冲正与幂等重放；结算单的受理、读取、推进（把引用的待处理退款原子推进为已生效）与撤销（解除已生效结算单的全部核销，退款回到待处理）；以及订单对账批次的发起与读取（在订单层面把收款、退款与已生效结算单闭合核对，只核对留痕、不改任何单据）。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -29,6 +29,15 @@
 - `GET /settlements/{settlement_id}`：按标识读取结算单，返回 `settlement_id`、`order_id`、`amount_cents`、`refund_ids`、`reason`、`status`、`created_at`、`updated_at`；租户经 `X-Tenant` 隔离，不存在或跨租户返回 404。
 - `POST /settlements/{settlement_id}/advance`：结算推进。原子地把引用的待处理退款全部置为 `effective` 且结算单进入 `effective`，返回 200；任一引用不满足则全部保持原状并返回可区分错误：引用退款不存在（含属于其他订单者）404，已被其他结算单核销 409，已冲正 409，结算金额与引用退款合计不符 409；结算单不存在或跨租户 404；已生效结算单重复推进 409；对已撤销结算单推进 409。需带 `Idempotency-Key`，同一（租户、操作、结算单标识、请求指纹）重放返回首次结果（含首次错误）；不同幂等键并发推进同一结算单仅一个成功，其余 409。
 - `POST /settlements/{settlement_id}/revoke`：结算撤销。仅已生效（`effective`）结算单可撤销；原子地解除该结算单持有的全部核销声明、将其核销过且当前仍为 `effective` 的退款单置回 `pending`（继续占用可退额度，可被其他待处理结算单重新引用并在推进时核销），结算单进入终态 `revoked`，返回 200 与最新结算单对象。任一不满足则全部保持原状并返回可区分错误：结算单不存在或跨租户 404（不泄漏对象是否存在）；已撤销结算单重复撤销 409；待处理（`pending`）结算单撤销 409。撤销只解除核销关系，不改变退款单本身状态——推进后又被冲正的退款在撤销时保持 `reversed`。退款冲正仍只作用于退款单，与撤销互不替代。需带 `Idempotency-Key`，同一（租户、操作、结算单标识、请求指纹）重放返回首次结果（含首次错误，如首次为 404/409 则重放仍为同一 404/409），不产生第二次撤销或第二次状态翻转；不同幂等键并发撤销同一结算单仅一个生效，其余 409；撤销与推进并发作用于同一结算单或同一批退款时也仅一个操作生效，另一个被拒绝且不改变已存在数据。
+- `POST /reconciliations`：发起订单对账批次。请求字段 `batch_id`、`order_id`、`note`（核对说明，可空）；租户经 `X-Tenant` 传入，`Idempotency-Key` 必填。成功返回 201，批次进入 `completed`，返回 `batch_id`、`order_id`、`note`、核对时各项合计（`paid_cents`、`pending_refunds_cents`、`effective_refunds_cents`、`effective_settlements_cents`、`verified_balance_cents`）、`conclusion`、`status`、`created_at`、`completed_at`。核对关系：已收金额 = 待处理退款合计 + 已生效退款合计 + 已核销结余，其中已核销结余 = 已收金额 −（待处理 + 已生效）退款合计；占用额度 ≤ 已收金额 ≤ 订单金额成立时结论为 `balanced`，否则为 `refund_total_exceeds_received`。对账只做核对与留痕，不改变订单、退款、结算单的任何状态与金额。订单不存在或跨租户返回 404（不泄漏对象是否存在）；批次标识在同一租户重复发起返回 409；同一订单已有进行中批次时并发再发起仅一个进入，其余返回 409（`detail` 为 `another reconciliation for this order is already in progress`）且不创建批次、不改变已存在批次。完成后订单继续发生的收支变化不追溯修改已完成结论，需要时重新发起即可。
+- `GET /reconciliations/{batch_id}`：按批次标识读取对账结论，返回发起接口的同一对象；租户经 `X-Tenant` 隔离，不存在或跨租户返回 404（不泄漏对象是否存在）。
+
+### 对账与幂等说明
+
+- 对账在单个 `BEGIN IMMEDIATE` 事务内对订单已收、退款合计、已生效结算单合计做原子快照：执行期间订单被收款、退款受理或冲正、结算推进或撤销改动时，对账要么基于改动前读数原子完成并留痕，要么整体失败返回可区分冲突，不留下进行中批次或部分结论。
+- 同一订单同一时刻至多一个进行中批次：进程内按（租户, 订单）互斥使并发发起者快速返回 409，数据库 `reconciliation_batches` 上的部分唯一索引 `ux_reconciliations_inprogress_per_order` 兜底。
+- 对账复用统一幂等记录：同一（租户, `reconcile`, 批次标识, `Idempotency-Key`）重复提交返回与首次完全相同的业务结果（含首次 404/409），不产生第二次对账、第二次留痕或第二次状态翻转；记录持久化落库，重启后仍识别为重放。读取（GET）天然幂等，不纳入去重记录。
+- 对账只读不写业务表，故在任意操作序列后，可退金额 = 已收金额 −（待处理 + 已生效）退款合计、且 占用额度 ≤ 已收金额 ≤ 订单金额 的守恒关系继续成立。
 
 ### 退款与幂等说明
 
@@ -68,6 +77,14 @@ curl -s -X POST localhost:8000/settlements/s1/advance \
 # 结算撤销：解除全部核销，退款回到 pending，结算单进入 revoked（终态）
 curl -s -X POST localhost:8000/settlements/s1/revoke \
   -H 'X-Tenant: t1' -H 'Idempotency-Key: rev-stl-0001'
+
+# 发起订单对账批次（同一 Idempotency-Key 可安全重放；批次完成后即为结论快照）
+curl -s -X POST localhost:8000/reconciliations -H 'X-Tenant: t1' -H 'Idempotency-Key: rec-0001' \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"b1","order_id":"o1","note":"月末对账"}'
+
+# 按批次标识读取对账结论
+curl -s localhost:8000/reconciliations/b1 -H 'X-Tenant: t1'
 ```
 - `GET /health`：返回服务与数据库状态。
 
@@ -81,5 +98,5 @@ curl -s -X POST localhost:8000/settlements/s1/revoke \
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入只支持小样本同步方式。
-- 收款只支持整单登记，未实现分期与对账。
+- 收款只支持整单登记，未实现分期。
 - 退款受理后为待处理（`pending`），由结算推进（`POST /settlements` + `/advance`）原子推进为已生效（`effective`）；服务自身不做自动结算。
