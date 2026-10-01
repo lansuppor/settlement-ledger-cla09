@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；退款单的受理、读取、冲正与幂等重放；结算单的受理、读取、推进（把引用的待处理退款原子推进为已生效）与撤销（解除已生效结算单的全部核销，退款回到待处理）；以及订单对账（按订单核对已收、退款与已生效结算合计并留痕，不改变任何单据状态）。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；退款单的受理、读取、冲正与幂等重放；结算单的受理、读取、推进（把引用的待处理退款原子推进为已生效）与撤销（解除已生效结算单的全部核销，退款回到待处理）；订单对账（按订单核对已收、退款与已生效结算合计并留痕，不改变任何单据状态）；以及工单的受理、读取与处理/解决/关闭状态流转（异常处理诉求登记成可跟踪的独立单据，不符对账未结清前禁止解决）。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -31,6 +31,11 @@
 - `POST /settlements/{settlement_id}/revoke`：结算撤销。仅已生效（`effective`）结算单可撤销；原子地解除该结算单持有的全部核销声明、将其核销过且当前仍为 `effective` 的退款单置回 `pending`（继续占用可退额度，可被其他待处理结算单重新引用并在推进时核销），结算单进入终态 `revoked`，返回 200 与最新结算单对象。任一不满足则全部保持原状并返回可区分错误：结算单不存在或跨租户 404（不泄漏对象是否存在）；已撤销结算单重复撤销 409；待处理（`pending`）结算单撤销 409。撤销只解除核销关系，不改变退款单本身状态——推进后又被冲正的退款在撤销时保持 `reversed`。退款冲正仍只作用于退款单，与撤销互不替代。需带 `Idempotency-Key`，同一（租户、操作、结算单标识、请求指纹）重放返回首次结果（含首次错误，如首次为 404/409 则重放仍为同一 404/409），不产生第二次撤销或第二次状态翻转；不同幂等键并发撤销同一结算单仅一个生效，其余 409；撤销与推进并发作用于同一结算单或同一批退款时也仅一个操作生效，另一个被拒绝且不改变已存在数据。
 - `POST /reconciliations`：发起并执行订单对账批次。请求字段 `batch_id`、`order_id`、`note`（核对说明，可空）；租户经 `X-Tenant` 传入，`Idempotency-Key` 必填。在同一事务内读取订单当前已收金额、待处理退款合计、已生效退款合计与已生效结算单合计，得出已核销结余（= 已收金额 −（待处理 + 已生效）退款合计）与核对结论（`balanced`/`mismatched`），批次进入 `completed` 并返回 201 与完整批次对象；对账只核对与留痕，不改变订单、退款、结算单的任何状态与金额。订单不存在或跨租户返回 404（不泄漏对象是否存在）；批次标识重复返回 409；同一订单已有进行中批次或执行期间有并发写入（收款、退款受理/冲正、结算推进/撤销、另一批次对账）返回可区分的 409，且整体失败、不留进行中批次或部分结论。同一订单同时只允许一个进行中的对账批次。
 - `GET /reconciliations/{batch_id}`：按批次标识读取对账批次，返回 `batch_id`、`order_id`、`note`、`paid_cents`、`pending_refund_cents`、`effective_refund_cents`、`effective_settlement_cents`、`settled_balance_cents`、`conclusion`、`status`、`created_at`、`completed_at`；租户经 `X-Tenant` 隔离，不存在或跨租户返回 404（不泄漏对象是否存在）。已完成批次的结论不随订单后续收支变化而追溯修改，需要时以新批次标识重新发起即可。
+- `POST /work-orders`：受理工单。请求字段 `work_order_id`、`order_id`、`issue`（问题说明，可空）；租户经 `X-Tenant` 传入，`Idempotency-Key` 必填。受理成功返回 201，工单为 `pending`（待处理），返回工单标识、订单标识、问题说明、解决说明（初始为空串）、状态、创建时间与更新时间。目标订单不存在或跨租户返回 404（不泄漏对象是否存在）；同一租户工单标识重复受理返回 409 且不改变已存在工单；参数不合法返回 400/422。
+- `GET /work-orders/{work_order_id}`：按工单标识读取工单，返回 `work_order_id`、`order_id`、`issue`、`resolution`、`status`、`created_at`、`updated_at`；租户经 `X-Tenant` 隔离，不存在或跨租户返回 404。
+- `POST /work-orders/{work_order_id}/process`：工单处理。把待处理（`pending`）或处理中（`in_progress`）的工单推进/保持为 `in_progress`，返回 200 与最新工单对象；已解决（`resolved`）或已关闭（`closed`）的工单处理返回 409 且不改变状态。不存在或跨租户返回 404。需带 `Idempotency-Key`。
+- `POST /work-orders/{work_order_id}/resolve`：工单解决。请求字段可选 `resolution`（解决说明，默认空串）；把待处理或处理中的工单置为 `resolved` 并记录解决说明，返回 200；已关闭工单解决返回 409 且不改变状态。若该工单所属订单存在结论为不符（`mismatched`）且已完成的对账批次、且其后没有更新的相符（`balanced`）已完成批次，则解决被拒绝并返回 409 且不改变工单状态；以新批次重新对账得到相符结论后才可解决。已关闭工单不受对账限制（但已关闭工单本身不可再解决）。不存在或跨租户返回 404。需带 `Idempotency-Key`。
+- `POST /work-orders/{work_order_id}/close`：工单关闭。把待处理、处理中或已解决的工单置为终态 `closed`，返回 200；对已关闭工单重复关闭返回 409 且不改变状态。不受对账未结清限制。不存在或跨租户返回 404。需带 `Idempotency-Key`。
 
 ### 退款与幂等说明
 
@@ -39,6 +44,7 @@
 - 结算推进为单事务原子操作：引用退款全部进入 `effective` 且结算单进入 `effective`，或全部保持原状；同一退款单只能被一张已生效结算单核销（声明表唯一约束兜底）。
 - 结算撤销为单事务原子操作：结算单进入终态 `revoked`、其全部核销声明解除、退款回到 `pending`，要么一并发生要么全部保持原状。撤销后退款可被另一张结算单重新核销，但同一退款同一时刻仍至多被一张已生效结算单核销；撤销只解除核销关系，不改变退款单状态（与退款冲正互不替代）。
 - 幂等重放以（租户, 操作, 目标标识, `Idempotency-Key`）去重：同一键重复提交返回与首次完全相同的业务结果（含首次错误），不会产生第二次受理、第二次扣减、第二次释放、第二次状态翻转或第二次撤销；重启后依然识别为重放。不同幂等键指向同一目标标识并发提交时仅一个生效，其余返回 409。
+- 工单的登记、处理、解决与关闭同样按（租户, 操作, 工单标识, `Idempotency-Key`）幂等去重（操作分别为 `work_order_accept`/`work_order_process`/`work_order_resolve`/`work_order_close`）：同一指纹重放返回首次结果（含首次 404/409），不产生第二次登记或第二次状态翻转；不同指纹并发翻转同一工单仅一个生效，其余 409 且不改变已存在数据。工单的登记与状态翻转均为单事务原子操作，不改变订单、退款、结算单与对账批次的任何状态、金额与结论。
 
 ### 对账说明
 
@@ -87,6 +93,27 @@ curl -s -X POST localhost:8000/reconciliations -H 'X-Tenant: t1' -H 'Idempotency
 
 # 按批次标识读取对账结果
 curl -s localhost:8000/reconciliations/b1 -H 'X-Tenant: t1'
+
+# 受理工单（异常处理诉求登记，同一 Idempotency-Key 可安全重放）
+curl -s -X POST localhost:8000/work-orders -H 'X-Tenant: t1' -H 'Idempotency-Key: wo-0001' \
+  -H 'Content-Type: application/json' \
+  -d '{"work_order_id":"w1","order_id":"o1","issue":"客户反馈少发货"}'
+
+# 读取工单
+curl -s localhost:8000/work-orders/w1 -H 'X-Tenant: t1'
+
+# 处理：pending/in_progress -> in_progress
+curl -s -X POST localhost:8000/work-orders/w1/process \
+  -H 'X-Tenant: t1' -H 'Idempotency-Key: wo-proc-0001'
+
+# 解决：pending/in_progress -> resolved（存在未结清的不符对账批次时返回 409）
+curl -s -X POST localhost:8000/work-orders/w1/resolve \
+  -H 'X-Tenant: t1' -H 'Idempotency-Key: wo-res-0001' \
+  -H 'Content-Type: application/json' -d '{"resolution":"核实后已补发"}'
+
+# 关闭：pending/in_progress/resolved -> closed（终态，不受对账限制）
+curl -s -X POST localhost:8000/work-orders/w1/close \
+  -H 'X-Tenant: t1' -H 'Idempotency-Key: wo-close-0001'
 ```
 - `GET /health`：返回服务与数据库状态。
 
