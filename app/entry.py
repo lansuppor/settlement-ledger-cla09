@@ -1,8 +1,10 @@
 import argparse
+from typing import Annotated
+
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from app.config import tenant_header
-from app.store import orders, refunds
+from app.store import orders, refunds, settlements
 from app.store.db import connect, migrate
 from app.rules import order_rules
 
@@ -21,6 +23,13 @@ class RefundIn(BaseModel):
     refund_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
+    reason: str = Field(default="")
+
+class SettlementIn(BaseModel):
+    settlement_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+    refund_ids: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
     reason: str = Field(default="")
 
 @app.get("/health")
@@ -95,9 +104,47 @@ def reverse_refund(refund_id: str, x_tenant: str = Header(default=""),
     outcome = refunds.reverse(x_tenant, refund_id, idempotency_key)
     return _render(outcome)
 
+@app.post("/settlements", status_code=201)
+def create_settlement(body: SettlementIn, x_tenant: str = Header(default=""),
+                      idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = settlements.accept(x_tenant, body.settlement_id, body.order_id, body.amount_cents,
+                                 body.refund_ids, body.reason, idempotency_key)
+    return _render_settlement(outcome)
+
+@app.get("/settlements/{settlement_id}")
+def read_settlement(settlement_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    settlement = settlements.get(x_tenant, settlement_id)
+    if settlement is None:
+        raise HTTPException(status_code=404, detail="settlement not found")
+    return settlement
+
+@app.post("/settlements/{settlement_id}/advance", status_code=200)
+def advance_settlement(settlement_id: str, x_tenant: str = Header(default=""),
+                       idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = settlements.advance(x_tenant, settlement_id, idempotency_key)
+    return _render_settlement(outcome)
+
 def _render(outcome: refunds.Outcome) -> dict:
     if outcome.code != "ok":
         raise HTTPException(status_code=outcome.status, detail=outcome.detail)
+    return outcome.body
+
+def _render_settlement(outcome: settlements.Outcome) -> dict:
+    if outcome.code != "ok":
+        raise HTTPException(
+            status_code=outcome.status,
+            detail={"code": outcome.code, "message": outcome.detail},
+        )
     return outcome.body
 
 def main() -> None:
