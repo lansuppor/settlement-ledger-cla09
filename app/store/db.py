@@ -1,8 +1,9 @@
 import sqlite3
 from pathlib import Path
+
 from app.config import db_path
 
-SCHEMA = Path(__file__).resolve().parents[2] / "migrations" / "001_init.sql"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
 def connect() -> sqlite3.Connection:
     path = db_path()
@@ -15,6 +16,7 @@ def connect() -> sqlite3.Connection:
 def migrate() -> None:
     conn = connect()
     try:
-        conn.executescript(SCHEMA.read_text(encoding="utf-8"))
+        for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            conn.executescript(path.read_text(encoding="utf-8"))
     finally:
         conn.close()

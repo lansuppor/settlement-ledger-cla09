@@ -1,5 +1,5 @@
-import sqlite3
 from app.store.db import connect
+
 
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
