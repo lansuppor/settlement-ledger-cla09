@@ -2,7 +2,7 @@ import argparse
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from app.config import tenant_header
-from app.store import orders, reconciliations, refunds, settlements
+from app.store import orders, reconciliations, refunds, settlements, tickets
 from app.store.db import connect, migrate
 from app.rules import order_rules
 
@@ -34,6 +34,14 @@ class ReconciliationIn(BaseModel):
     batch_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
     note: str = Field(default="")
+
+class TicketIn(BaseModel):
+    ticket_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    issue: str = Field(min_length=1)
+
+class TicketResolutionIn(BaseModel):
+    resolution_note: str = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -167,6 +175,57 @@ def read_reconciliation(batch_id: str, x_tenant: str = Header(default="")) -> di
     if batch is None:
         raise HTTPException(status_code=404, detail="reconciliation batch not found")
     return batch
+
+@app.post("/tickets", status_code=201)
+def create_ticket(body: TicketIn, x_tenant: str = Header(default=""),
+                  idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = tickets.accept(x_tenant, body.ticket_id, body.order_id,
+                             body.issue, idempotency_key)
+    return _render(outcome)
+
+@app.get("/tickets/{ticket_id}")
+def read_ticket(ticket_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    ticket = tickets.get(x_tenant, ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket not found")
+    return ticket
+
+@app.post("/tickets/{ticket_id}/process", status_code=200)
+def process_ticket(ticket_id: str, x_tenant: str = Header(default=""),
+                   idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = tickets.process(x_tenant, ticket_id, idempotency_key)
+    return _render(outcome)
+
+@app.post("/tickets/{ticket_id}/resolve", status_code=200)
+def resolve_ticket(ticket_id: str, body: TicketResolutionIn,
+                   x_tenant: str = Header(default=""),
+                   idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = tickets.resolve(x_tenant, ticket_id, body.resolution_note, idempotency_key)
+    return _render(outcome)
+
+@app.post("/tickets/{ticket_id}/close", status_code=200)
+def close_ticket(ticket_id: str, x_tenant: str = Header(default=""),
+                 idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = tickets.close(x_tenant, ticket_id, idempotency_key)
+    return _render(outcome)
 
 def _render(outcome) -> dict:
     if outcome.code != "ok":
