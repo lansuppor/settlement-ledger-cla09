@@ -107,6 +107,60 @@ def create_refund(body: RefundIn, x_tenant: str = Header(default=""),
                              body.amount_cents, body.reason, idempotency_key)
     return _render(outcome)
 
+@app.get("/refunds/summary")
+def summarize_refunds(
+    x_tenant: str = Header(default=""),
+    order_id: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=refunds.DEFAULT_PAGE_LIMIT, ge=1,
+                       le=refunds.MAX_PAGE_LIMIT),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        return refunds.summary(x_tenant, order_id=order_id, cursor=cursor, limit=limit)
+    except refunds.InvalidCursor:
+        raise HTTPException(status_code=400, detail="cursor is invalid")
+    except refunds.OrderSummaryNotFound:
+        raise HTTPException(status_code=400,
+                            detail="order has no refund summary")
+
+@app.get("/refunds")
+def list_refunds(
+    x_tenant: str = Header(default=""),
+    order_id: str | None = Query(default=None),
+    status: Literal["pending", "effective", "reversed"] | None = Query(default=None),
+    amount_min: int | None = Query(default=None, ge=1),
+    amount_max: int | None = Query(default=None, ge=1),
+    created_from: str | None = Query(default=None),
+    created_to: str | None = Query(default=None),
+    include_reversed: bool | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=refunds.DEFAULT_PAGE_LIMIT, ge=1,
+                       le=refunds.MAX_PAGE_LIMIT),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if amount_min is not None and amount_max is not None and amount_min > amount_max:
+        raise HTTPException(status_code=400, detail="amount_min must not be greater than amount_max")
+    if created_from is not None and created_to is not None and created_from > created_to:
+        raise HTTPException(status_code=400, detail="created_from must not be later than created_to")
+    if status is not None and include_reversed is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="status and include_reversed are mutually exclusive",
+        )
+    try:
+        return refunds.search(
+            x_tenant, order_id=order_id,
+            amount_min=amount_min, amount_max=amount_max,
+            created_from=created_from, created_to=created_to,
+            status=status, include_reversed=bool(include_reversed),
+            cursor=cursor, limit=limit,
+        )
+    except refunds.InvalidCursor:
+        raise HTTPException(status_code=400, detail="cursor is invalid")
+
 @app.get("/refunds/{refund_id}")
 def read_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:
