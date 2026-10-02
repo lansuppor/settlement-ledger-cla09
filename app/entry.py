@@ -87,16 +87,14 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
     return order
 
 @app.post("/orders/{order_id}/payments")
-def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
+def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default=""),
+                idempotency_key: str = Header(default="")) -> dict:
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
-    try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error))
-    if order is None:
-        raise HTTPException(status_code=404, detail="order not found")
-    return order
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    return _render(orders.register_payment(x_tenant, order_id, body.amount_cents,
+                                           idempotency_key))
 
 @app.post("/refunds", status_code=201)
 def create_refund(body: RefundIn, x_tenant: str = Header(default=""),
