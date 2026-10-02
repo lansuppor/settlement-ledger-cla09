@@ -13,10 +13,30 @@ def connect(timeout: float = 5.0) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
+def _run_script(conn: sqlite3.Connection, script: str) -> None:
+    """Apply a migration statement by statement.
+
+    DDL is otherwise idempotent (CREATE TABLE/INDEX IF NOT EXISTS); the only
+    non-idempotent form is ``ALTER TABLE ... ADD COLUMN`` (SQLite has no
+    ``IF NOT EXISTS`` for columns), whose "duplicate column name" error on a
+    re-run means the column is already present and is safely ignored, keeping
+    migrations reentrant.
+    """
+    statement = ""
+    for line in script.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            try:
+                conn.execute(statement.strip())
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error):
+                    raise
+            statement = ""
+
 def migrate() -> None:
     conn = connect()
     try:
         for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            conn.executescript(path.read_text(encoding="utf-8"))
+            _run_script(conn, path.read_text(encoding="utf-8"))
     finally:
         conn.close()

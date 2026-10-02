@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TENANT = "sm"
 H = {"X-Tenant": TENANT}
 
-MOVEMENT_FIELDS = {"movement_id", "order_id", "direction", "quantity", "created_at"}
+MOVEMENT_FIELDS = {"movement_id", "order_id", "direction", "quantity", "status", "created_at"}
 
 
 def _make_order(order_id: str, amount: int = 1000, paid: int | None = None,
@@ -41,6 +41,11 @@ def _accept(movement_id: str, order_id: str, key: str, direction: str = "in",
     )
 
 
+def _reverse(movement_id: str, key: str, tenant: str = TENANT):
+    return client.post(f"/stock-movements/{movement_id}/reverse",
+                       headers={"X-Tenant": tenant, "Idempotency-Key": key})
+
+
 def _get(movement_id: str, tenant: str = TENANT):
     return client.get(f"/stock-movements/{movement_id}", headers={"X-Tenant": tenant})
 
@@ -50,14 +55,28 @@ def _search(tenant: str = TENANT, **params):
 
 
 def _insert_direct(movement_id: str, order_id: str, direction: str, quantity: int,
-                   created_at: str, tenant: str = TENANT) -> None:
+                   created_at: str, tenant: str = TENANT, status: str = "accepted") -> None:
     conn = connect()
     try:
         conn.execute(
-            "INSERT INTO stock_movements(tenant, movement_id, order_id, direction, quantity, created_at) "
-            "VALUES(?,?,?,?,?,?)",
-            (tenant, movement_id, order_id, direction, quantity, created_at),
+            "INSERT INTO stock_movements(tenant, movement_id, order_id, direction, quantity, status, created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (tenant, movement_id, order_id, direction, quantity, status, created_at),
         )
+    finally:
+        conn.close()
+
+
+def _net_quantity(order_id: str, tenant: str = TENANT) -> int:
+    """Quantity-summary view: accepted in sum minus accepted out sum; reversed counts 0."""
+    conn = connect()
+    try:
+        return conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN direction='in' AND status='accepted' THEN quantity ELSE 0 END),0) "
+            "- COALESCE(SUM(CASE WHEN direction='out' AND status='accepted' THEN quantity ELSE 0 END),0) AS n "
+            "FROM stock_movements WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()["n"]
     finally:
         conn.close()
 
@@ -75,6 +94,7 @@ def test_accept_movement_is_readable_and_keeps_values() -> None:
         assert body["order_id"] == "smo1"
         assert body["direction"] == direction
         assert body["quantity"] == quantity
+        assert body["status"] == "accepted"
         assert isinstance(body["created_at"], str) and body["created_at"]
 
         got = _get(mid)
@@ -421,3 +441,317 @@ def test_movements_never_mutate_other_documents() -> None:
                              "amount_cents": 1, "reason": "x"},
                        headers={**H, "Idempotency-Key": "sm14-r3"})
     assert over.status_code == 409
+
+
+# ---------- reverse ----------
+
+def test_reverse_accepted_movement_returns_terminal_and_preserves_fields() -> None:
+    _make_order("smo15")
+    first = _accept("sm15-a", "smo15", "sm15-acc", direction="out", quantity=77)
+    assert first.status_code == 201
+
+    resp = _reverse("sm15-a", "sm15-rev")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == MOVEMENT_FIELDS
+    assert body["movement_id"] == "sm15-a"
+    assert body["order_id"] == "smo15"
+    assert body["direction"] == "out"
+    assert body["quantity"] == 77
+    assert body["status"] == "reversed"
+    assert body["created_at"] == first.json()["created_at"]
+
+    got = _get("sm15-a")
+    assert got.status_code == 200 and got.json() == body
+    assert got.json()["status"] == "reversed"
+    # net quantity summary now counts the reversed movement as 0
+    assert _net_quantity("smo15") == 0
+
+
+def test_reverse_keeps_direction_and_quantity_verbatim() -> None:
+    _make_order("smo16")
+    accepted = _accept("sm16-a", "smo16", "sm16-acc", direction="in", quantity=123).json()
+    _reverse("sm16-a", "sm16-rev")
+    row_body = _get("sm16-a").json()
+    assert row_body["direction"] == "in" and row_body["quantity"] == 123
+    assert row_body["created_at"] == accepted["created_at"]
+
+
+def test_reverse_missing_or_cross_tenant_is_404_without_leak_or_change() -> None:
+    missing = _reverse("sm17-ghost", "sm17-rev")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "stock movement not found"
+
+    _make_order("smo18")
+    _accept("sm18-a", "smo18", "sm18-acc", direction="in", quantity=5)
+    cross = _reverse("sm18-a", "sm18-rev", tenant="t2")
+    assert cross.status_code == 404
+    assert cross.json()["detail"] == "stock movement not found"
+    # nothing changed for the owning tenant
+    assert _get("sm18-a").json()["status"] == "accepted"
+    assert _net_quantity("smo18") == 5
+
+
+def test_reverse_already_reversed_is_409_and_flips_once() -> None:
+    _make_order("smo19")
+    _accept("sm19-a", "smo19", "sm19-acc", direction="in", quantity=10)
+    assert _reverse("sm19-a", "sm19-rev-a").status_code == 200
+    again = _reverse("sm19-a", "sm19-rev-b")
+    assert again.status_code == 409
+    assert again.json()["detail"] == "stock movement already reversed"
+    assert _get("sm19-a").json()["status"] == "reversed"
+
+    conn = connect()
+    try:
+        flips = conn.execute(
+            "SELECT COUNT(*) c FROM stock_movements "
+            "WHERE tenant=? AND movement_id='sm19-a' AND status='reversed'",
+            (TENANT,),
+        ).fetchone()["c"]
+        reverse_records = conn.execute(
+            "SELECT COUNT(*) c FROM idempotent_requests "
+            "WHERE tenant=? AND target_id='sm19-a' AND operation='stock_movement_reverse'",
+            (TENANT,),
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    assert flips == 1 and reverse_records == 2  # one ok + one recorded 409
+
+
+def test_reverse_requires_headers() -> None:
+    assert client.post("/stock-movements/whatever/reverse", headers=H).status_code == 400
+    assert client.post("/stock-movements/whatever/reverse",
+                       headers={"Idempotency-Key": "k"}).status_code == 400
+
+
+# ---------- reverse: idempotent replay ----------
+
+def test_reverse_replay_returns_first_result_and_reverses_once() -> None:
+    _make_order("smo20")
+    _accept("sm20-a", "smo20", "sm20-acc", direction="out", quantity=40)
+    a = _reverse("sm20-a", "same-rev-key")
+    b = _reverse("sm20-a", "same-rev-key")
+    assert a.status_code == b.status_code == 200 and a.json() == b.json()
+
+    conn = connect()
+    try:
+        records = conn.execute(
+            "SELECT COUNT(*) c FROM idempotent_requests "
+            "WHERE target_id='sm20-a' AND operation='stock_movement_reverse'").fetchone()["c"]
+        movements = conn.execute(
+            "SELECT COUNT(*) c FROM stock_movements WHERE movement_id='sm20-a'").fetchone()["c"]
+    finally:
+        conn.close()
+    assert records == 1 and movements == 1
+
+
+def test_failed_reverse_404_is_replayed_identically_then_new_key_succeeds() -> None:
+    first = _reverse("sm21-a", "sm21-rev")
+    assert first.status_code == 404
+    _make_order("smo21")
+    _accept("sm21-a", "smo21", "sm21-acc", direction="in", quantity=9)
+    replay = _reverse("sm21-a", "sm21-rev")
+    assert replay.status_code == 404 and replay.json() == first.json()
+    # state untouched by the replayed 404
+    assert _get("sm21-a").json()["status"] == "accepted"
+    assert _reverse("sm21-a", "sm21-rev-retry").status_code == 200
+    assert _get("sm21-a").json()["status"] == "reversed"
+
+
+def test_failed_reverse_409_is_replayed_identically() -> None:
+    _make_order("smo22")
+    _accept("sm22-a", "smo22", "sm22-acc", direction="in", quantity=3)
+    assert _reverse("sm22-a", "sm22-rev-a").status_code == 200
+    early = _reverse("sm22-a", "dup-key")
+    assert early.status_code == 409
+    replay = _reverse("sm22-a", "dup-key")
+    assert replay.status_code == 409 and replay.json() == early.json()
+    assert _get("sm22-a").json()["status"] == "reversed"
+
+
+def test_concurrent_reverses_distinct_keys_only_one_wins() -> None:
+    _make_order("smo23")
+    _accept("sm23-a", "smo23", "sm23-acc", direction="in", quantity=50)
+    codes: list[int] = []
+    barrier = threading.Barrier(8)
+
+    def run(i: int, barrier: threading.Barrier) -> None:
+        barrier.wait()
+        codes.append(_reverse("sm23-a", f"sm23-rev-{i}").status_code)
+
+    threads = [threading.Thread(target=run, args=(i, barrier)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(codes).count(200) == 1
+    assert sorted(codes).count(409) == 7
+    conn = connect()
+    try:
+        status = conn.execute(
+            "SELECT status FROM stock_movements WHERE tenant=? AND movement_id='sm23-a'",
+            (TENANT,),
+        ).fetchone()["status"]
+    finally:
+        conn.close()
+    assert status == "reversed"
+
+
+def test_reverse_replay_survives_process_restart() -> None:
+    db_file = os.path.join(tempfile.mkdtemp(), "restart-stock-reverse.sqlite")
+    env = {**os.environ, "APP_DB": db_file, "PYTHONPATH": str(ROOT)}
+    script = (
+        "import json, sys\n"
+        "from app.store.db import migrate\n"
+        "from app.store import orders, stock_movements\n"
+        "migrate()\n"
+        "if sys.argv[1] == 'first':\n"
+        "    orders.insert('sm','sro',1000,'CNY')\n"
+        "    stock_movements.accept('sm','sra','sro','in',42,'sra-key')\n"
+        "out = stock_movements.reverse('sm','sra','sra-rev-key')\n"
+        "print(json.dumps({'http': out.status, 'body': out.body}))\n"
+    )
+    first = subprocess.run([sys.executable, "-c", script, "first"], env=env,
+                           cwd=ROOT, capture_output=True, text=True, check=False)
+    second = subprocess.run([sys.executable, "-c", script, "second"], env=env,
+                            cwd=ROOT, capture_output=True, text=True, check=False)
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    a, b = json.loads(first.stdout.strip()), json.loads(second.stdout.strip())
+    assert a == b and a["http"] == 200 and a["body"]["status"] == "reversed"
+
+
+# ---------- search with status ----------
+
+def test_search_default_hides_reversed_and_filters_by_status() -> None:
+    _make_order("smo24")
+    t = "2026-07-01T00:00:00+00:00"
+    _insert_direct("sm24-a", "smo24", "in", 10, t)
+    _insert_direct("sm24-b", "smo24", "in", 20, t, status="reversed")
+    _insert_direct("sm24-c", "smo24", "out", 30, t)
+    _insert_direct("sm24-d", "smo24", "out", 40, t, status="reversed")
+
+    def ids(**params) -> list[str]:
+        resp = _search(order_id="smo24", **params)
+        assert resp.status_code == 200, resp.text
+        return [i["movement_id"] for i in resp.json()["items"]]
+
+    # default: accepted only
+    assert ids() == ["sm24-a", "sm24-c"]
+    # exact status filter
+    assert ids(status="accepted") == ["sm24-a", "sm24-c"]
+    assert ids(status="reversed") == ["sm24-b", "sm24-d"]
+    # include_reversed=true returns everything in stable order
+    assert ids(include_reversed="true") == ["sm24-a", "sm24-b", "sm24-c", "sm24-d"]
+    assert ids(include_reversed="false") == ["sm24-a", "sm24-c"]
+    # status combines with other filters as AND
+    assert ids(status="reversed", direction="out") == ["sm24-d"]
+    assert ids(include_reversed="true", quantity_min=20, quantity_max=30) == ["sm24-b", "sm24-c"]
+
+
+def test_search_status_and_include_reversed_together_is_400() -> None:
+    resp = _search(status="accepted", include_reversed="true")
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "status and include_reversed are mutually exclusive"
+
+
+def test_search_invalid_status_and_include_reversed_values() -> None:
+    assert _search(status="bogus").status_code == 422
+    assert _search(include_reversed="maybe").status_code == 422
+
+
+def test_search_pagination_over_mixed_statuses_covers_everything_once() -> None:
+    _make_order("smo25")
+    ts = "2026-08-01T00:00:00+00:00"
+    for i in range(1, 8):
+        _insert_direct(f"sm25-{i}", "smo25", "in", i, ts,
+                       status="reversed" if i % 2 == 0 else "accepted")
+    walked = _walk_pages(TENANT, 3, order_id="smo25", include_reversed="true")
+    assert [i["movement_id"] for i in walked] == [f"sm25-{i}" for i in range(1, 8)]
+    # status=reversed subset pages are complete too
+    walked_rev = _walk_pages(TENANT, 2, order_id="smo25", status="reversed")
+    assert [i["movement_id"] for i in walked_rev] == ["sm25-2", "sm25-4", "sm25-6"]
+    # accepted subset
+    walked_acc = _walk_pages(TENANT, 2, order_id="smo25")
+    assert [i["movement_id"] for i in walked_acc] == ["sm25-1", "sm25-3", "sm25-5", "sm25-7"]
+
+
+# ---------- conservation ----------
+
+def test_net_quantity_conservation_through_accept_reverse_replay_concurrency() -> None:
+    _make_order("smo26")
+    # accepted: in 100, in 50, out 40 -> net 110
+    _accept("sm26-in1", "smo26", "sm26-in1", direction="in", quantity=100)
+    _accept("sm26-in2", "smo26", "sm26-in2", direction="in", quantity=50)
+    _accept("sm26-out1", "smo26", "sm26-out1", direction="out", quantity=40)
+    assert _net_quantity("smo26") == 110
+
+    # reverse the out movement and one in movement: out counts 0, in counts 0
+    assert _reverse("sm26-out1", "sm26-out1-rev").status_code == 200
+    assert _reverse("sm26-in1", "sm26-in1-rev").status_code == 200
+    assert _net_quantity("smo26") == 50
+
+    # replays never flip twice and never change the summary
+    assert _reverse("sm26-out1", "sm26-out1-rev").status_code == 200
+    assert _reverse("sm26-in1", "sm26-in1-rev").status_code == 200
+    assert _reverse("sm26-in1", "other-key").status_code == 409
+    assert _net_quantity("smo26") == 50
+
+    conn = connect()
+    try:
+        statuses = {r["movement_id"]: r["status"] for r in conn.execute(
+            "SELECT movement_id, status FROM stock_movements WHERE tenant=? AND order_id='smo26'",
+            (TENANT,),
+        ).fetchall()}
+        reversals = conn.execute(
+            "SELECT COUNT(*) c FROM stock_movements "
+            "WHERE tenant=? AND order_id='smo26' AND status='reversed'",
+            (TENANT,),
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    assert statuses == {"sm26-in1": "reversed", "sm26-in2": "accepted",
+                        "sm26-out1": "reversed"}
+    assert reversals == 2
+
+
+def test_reverse_does_not_touch_other_documents_or_refundable() -> None:
+    _make_order("smo27", 1000, paid=800)
+    client.post("/refunds",
+                json={"refund_id": "sm27-r1", "order_id": "smo27",
+                      "amount_cents": 200, "reason": "x"},
+                headers={**H, "Idempotency-Key": "sm27-r1"})
+    client.post("/settlements",
+                json={"settlement_id": "sm27-s1", "order_id": "smo27",
+                      "amount_cents": 200, "refund_ids": ["sm27-r1"], "reason": "周期结算"},
+                headers={**H, "Idempotency-Key": "sm27-s1"})
+    client.post("/settlements/sm27-s1/advance",
+                headers={**H, "Idempotency-Key": "sm27-s1-adv"})
+    client.post("/tickets",
+                json={"ticket_id": "sm27-w1", "order_id": "smo27", "issue": "异常"},
+                headers={**H, "Idempotency-Key": "sm27-tkt"})
+
+    before = {
+        "order": client.get("/orders/smo27", headers=H).json(),
+        "refund": client.get("/refunds/sm27-r1", headers=H).json(),
+        "settlement": client.get("/settlements/sm27-s1", headers=H).json(),
+        "ticket": client.get("/tickets/sm27-w1", headers=H).json(),
+    }
+    _accept("sm27-m1", "smo27", "sm27-m1", direction="in", quantity=60)
+    assert _reverse("sm27-m1", "sm27-m1-rev").status_code == 200
+    after = {
+        "order": client.get("/orders/smo27", headers=H).json(),
+        "refund": client.get("/refunds/sm27-r1", headers=H).json(),
+        "settlement": client.get("/settlements/sm27-s1", headers=H).json(),
+        "ticket": client.get("/tickets/sm27-w1", headers=H).json(),
+    }
+    assert before == after
+    # refundable conservation still holds: paid 800 - (pending+effective) 200 = 600
+    assert client.post("/refunds",
+                       json={"refund_id": "sm27-r2", "order_id": "smo27",
+                             "amount_cents": 600, "reason": "x"},
+                       headers={**H, "Idempotency-Key": "sm27-r2"}).status_code == 201
+    assert client.post("/refunds",
+                       json={"refund_id": "sm27-r3", "order_id": "smo27",
+                             "amount_cents": 1, "reason": "x"},
+                       headers={**H, "Idempotency-Key": "sm27-r3"}).status_code == 409
