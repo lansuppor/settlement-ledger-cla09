@@ -30,6 +30,10 @@ INVALID_PARAM = "invalid_param"
 ACCEPT_OP = "stock_movement_accept"
 REVERSE_OP = "stock_movement_reverse"
 
+# Audit-trail actions recorded in stock_movement_events.
+ACCEPT_ACTION = "accept"
+REVERSE_ACTION = "reverse"
+
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 500
 
@@ -44,6 +48,28 @@ class OrderSummaryNotFound(Exception):
     Raised for the single-order summary lookup; the two cases are deliberately
     indistinguishable so the response never leaks whether the order exists.
     """
+
+
+def _record_event(conn: sqlite3.Connection, tenant: str, movement_id: str,
+                  action: str, status: str, direction: str, quantity: int,
+                  occurred_at: str) -> None:
+    """Append one audit event inside the caller's transaction.
+
+    ``seq`` is the next consecutive number within the movement (1-based) and is
+    never rewritten once stored. Called only on the success path of accept and
+    reverse, so replays, rejections and losing concurrent writers leave no
+    event behind.
+    """
+    seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM stock_movement_events "
+        "WHERE tenant=? AND movement_id=?",
+        (tenant, movement_id),
+    ).fetchone()["next_seq"]
+    conn.execute(
+        "INSERT INTO stock_movement_events(tenant, movement_id, seq, action, status, "
+        "direction, quantity, occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+        (tenant, movement_id, seq, action, status, direction, quantity, occurred_at),
+    )
 
 
 def _row_to_body(row: sqlite3.Row) -> dict:
@@ -75,6 +101,47 @@ def get(tenant: str, movement_id: str) -> dict | None:
     return None if row is None else _row_to_body(row)
 
 
+def events(tenant: str, movement_id: str) -> list[dict] | None:
+    """Return the audit trail of one movement, or ``None`` if it does not exist.
+
+    A missing or cross-tenant movement is indistinguishable (``None``, no
+    existence leak). Events are ordered by occurred_at ASC then seq ASC; seq is
+    consecutive from 1 within the movement and immutable once written, so the
+    accept event always precedes the reverse event (if any). Each entry carries
+    the action (``accept``/``reverse``), the movement status right after the
+    action (``accepted``/``reversed``) and the direction/quantity as accepted;
+    a reverse entry keeps the accepted direction and quantity verbatim.
+    Read-only: never changes any document.
+    """
+    conn = connect()
+    try:
+        movement = conn.execute(
+            "SELECT 1 FROM stock_movements WHERE tenant=? AND movement_id=?",
+            (tenant, movement_id),
+        ).fetchone()
+        if movement is None:
+            return None
+        rows = conn.execute(
+            "SELECT seq, action, status, direction, quantity, occurred_at "
+            "FROM stock_movement_events WHERE tenant=? AND movement_id=? "
+            "ORDER BY occurred_at ASC, seq ASC",
+            (tenant, movement_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "seq": row["seq"],
+            "action": row["action"],
+            "status": row["status"],
+            "direction": row["direction"],
+            "quantity": row["quantity"],
+            "occurred_at": row["occurred_at"],
+        }
+        for row in rows
+    ]
+
+
 def accept(tenant: str, movement_id: str, order_id: str, direction: str,
            quantity: int, fingerprint: str) -> Outcome:
     """Accept a stock movement for an order of the same tenant.
@@ -83,7 +150,9 @@ def accept(tenant: str, movement_id: str, order_id: str, direction: str,
     leak). Re-accepting the same movement id within a tenant conflicts without
     touching the existing movement; direction and quantity are stored verbatim
     and never change. A replayed request (same tenant/operation/movement/
-    fingerprint) returns the recorded first result, errors included.
+    fingerprint) returns the recorded first result, errors included. A
+    successful accept appends the movement's ``accept`` audit event in the
+    same transaction; failures, rejections and replays append nothing.
     """
     conn = connect()
     try:
@@ -122,6 +191,8 @@ def accept(tenant: str, movement_id: str, order_id: str, direction: str,
             "VALUES(?,?,?,?,?,?,?)",
             (tenant, movement_id, order_id, direction, quantity, ACCEPTED, created_at),
         )
+        _record_event(conn, tenant, movement_id, ACCEPT_ACTION, ACCEPTED,
+                      direction, quantity, created_at)
         body = {
             "movement_id": movement_id,
             "order_id": order_id,
@@ -149,6 +220,9 @@ def reverse(tenant: str, movement_id: str, fingerprint: str) -> Outcome:
     movement conflicts (409) without a second state flip. A replayed request
     (same tenant/operation/movement/fingerprint) returns the recorded first
     result, including a recorded 404/409, even if the movement later changes.
+    A successful reverse appends the movement's ``reverse`` audit event
+    (keeping the accepted direction/quantity) in the same transaction;
+    failures, rejections and replays append nothing.
     """
     conn = connect()
     try:
@@ -181,6 +255,8 @@ def reverse(tenant: str, movement_id: str, fingerprint: str) -> Outcome:
             "UPDATE stock_movements SET status=? WHERE tenant=? AND movement_id=?",
             (REVERSED, tenant, movement_id),
         )
+        _record_event(conn, tenant, movement_id, REVERSE_ACTION, REVERSED,
+                      row["direction"], row["quantity"], now_iso())
         body = {
             "movement_id": movement_id,
             "order_id": row["order_id"],
