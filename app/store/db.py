@@ -17,6 +17,11 @@ def migrate() -> None:
     conn = connect()
     try:
         for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            conn.executescript(path.read_text(encoding="utf-8"))
+            try:
+                conn.executescript(path.read_text(encoding="utf-8"))
+            except sqlite3.OperationalError as error:
+                # Re-running an already-applied ADD COLUMN migration is a no-op.
+                if "duplicate column name" not in str(error):
+                    raise
     finally:
         conn.close()

@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TENANT = "sm"
 H = {"X-Tenant": TENANT}
 
-MOVEMENT_FIELDS = {"movement_id", "order_id", "direction", "quantity", "created_at"}
+MOVEMENT_FIELDS = {"movement_id", "order_id", "direction", "quantity", "status", "created_at"}
 
 
 def _make_order(order_id: str, amount: int = 1000, paid: int | None = None,

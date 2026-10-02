@@ -290,6 +290,16 @@ def read_stock_movement(movement_id: str, x_tenant: str = Header(default="")) ->
         raise HTTPException(status_code=404, detail="stock movement not found")
     return movement
 
+@app.post("/stock-movements/{movement_id}/reverse", status_code=200)
+def reverse_stock_movement(movement_id: str, x_tenant: str = Header(default=""),
+                           idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = stock_movements.reverse(x_tenant, movement_id, idempotency_key)
+    return _render(outcome)
+
 @app.get("/stock-movements")
 def list_stock_movements(
     x_tenant: str = Header(default=""),
@@ -299,6 +309,8 @@ def list_stock_movements(
     quantity_max: int | None = Query(default=None, ge=1),
     created_from: str | None = Query(default=None),
     created_to: str | None = Query(default=None),
+    status: Literal["accepted", "reversed"] | None = Query(default=None),
+    include_reversed: bool = Query(default=False),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=stock_movements.DEFAULT_PAGE_LIMIT, ge=1,
                        le=stock_movements.MAX_PAGE_LIMIT),
@@ -307,11 +319,14 @@ def list_stock_movements(
         raise HTTPException(status_code=400, detail="tenant header is required")
     if quantity_min is not None and quantity_max is not None and quantity_min > quantity_max:
         raise HTTPException(status_code=400, detail="quantity_min must not be greater than quantity_max")
+    if status is not None and include_reversed:
+        raise HTTPException(status_code=400, detail="status and include_reversed must not be combined")
     try:
         return stock_movements.search(
             x_tenant, order_id=order_id, direction=direction,
             quantity_min=quantity_min, quantity_max=quantity_max,
             created_from=created_from, created_to=created_to,
+            status=status, include_reversed=include_reversed,
             cursor=cursor, limit=limit,
         )
     except stock_movements.InvalidCursor:

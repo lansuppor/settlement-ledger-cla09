@@ -7,12 +7,18 @@ from app.store.idempotency import lookup_replay, now_iso, record_and_finish, sto
 from app.store.outcome import Outcome
 
 # Stock movements are immutable records of inbound (in) / outbound (out)
-# quantities against an accepted order. They act only on themselves: accepting
-# or reading one never changes orders, refunds, settlements, reconciliation
-# batches, tickets or import tasks.
+# quantities against an accepted order. They act only on themselves: accepting,
+# reversing or reading one never changes orders, refunds, settlements,
+# reconciliation batches, tickets or import tasks.
 IN = "in"
 OUT = "out"
 DIRECTIONS = (IN, OUT)
+
+# Lifecycle: accepted -> reversed (terminal). Reversed movements count as zero
+# in every quantity summary; direction and quantity never change.
+ACCEPTED = "accepted"
+REVERSED = "reversed"
+STATUSES = (ACCEPTED, REVERSED)
 
 # Distinguishable error classes (mirrors the other stores' convention).
 NOT_FOUND = "not_found"
@@ -20,6 +26,7 @@ CONFLICT = "conflict"
 INVALID_PARAM = "invalid_param"
 
 ACCEPT_OP = "stock_movement_accept"
+REVERSE_OP = "stock_movement_reverse"
 
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 500
@@ -35,12 +42,13 @@ def _row_to_body(row: sqlite3.Row) -> dict:
         "order_id": row["order_id"],
         "direction": row["direction"],
         "quantity": row["quantity"],
+        "status": row["status"],
         "created_at": row["created_at"],
     }
 
 
 _SELECT = (
-    "SELECT movement_id, order_id, direction, quantity, created_at "
+    "SELECT movement_id, order_id, direction, quantity, status, created_at "
     "FROM stock_movements"
 )
 
@@ -100,15 +108,16 @@ def accept(tenant: str, movement_id: str, order_id: str, direction: str,
 
         created_at = now_iso()
         conn.execute(
-            "INSERT INTO stock_movements(tenant, movement_id, order_id, direction, quantity, created_at) "
-            "VALUES(?,?,?,?,?,?)",
-            (tenant, movement_id, order_id, direction, quantity, created_at),
+            "INSERT INTO stock_movements(tenant, movement_id, order_id, direction, quantity, status, created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (tenant, movement_id, order_id, direction, quantity, ACCEPTED, created_at),
         )
         body = {
             "movement_id": movement_id,
             "order_id": order_id,
             "direction": direction,
             "quantity": quantity,
+            "status": ACCEPTED,
             "created_at": created_at,
         }
         store_outcome(conn, tenant=tenant, operation=ACCEPT_OP, target_id=movement_id,
@@ -116,6 +125,66 @@ def accept(tenant: str, movement_id: str, order_id: str, direction: str,
                       body=body)
         conn.execute("COMMIT")
         return Outcome.created(body)
+    finally:
+        conn.close()
+
+
+def reverse(tenant: str, movement_id: str, fingerprint: str) -> Outcome:
+    """Reverse an accepted stock movement idempotently.
+
+    Reversal flips the movement to the terminal ``reversed`` status, after
+    which it counts as zero in every quantity summary; direction and quantity
+    stay verbatim. A missing or cross-tenant movement is indistinguishable
+    (404, no existence leak, no data change); reversing an already reversed
+    movement conflicts (409) without touching it. A replayed request (same
+    tenant/operation/movement/fingerprint) returns the recorded first result,
+    errors included, and never flips twice.
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        replay = lookup_replay(conn, tenant, REVERSE_OP, movement_id, fingerprint)
+        if replay is not None:
+            conn.execute("COMMIT")
+            return replay
+
+        row = conn.execute(
+            "SELECT order_id, direction, quantity, status, created_at "
+            "FROM stock_movements WHERE tenant=? AND movement_id=?",
+            (tenant, movement_id),
+        ).fetchone()
+        if row is None:
+            return record_and_finish(
+                conn, tenant=tenant, operation=REVERSE_OP, target_id=movement_id,
+                fingerprint=fingerprint, status=404, code=NOT_FOUND,
+                detail="stock movement not found",
+            )
+
+        if row["status"] == REVERSED:
+            return record_and_finish(
+                conn, tenant=tenant, operation=REVERSE_OP, target_id=movement_id,
+                fingerprint=fingerprint, status=409, code=CONFLICT,
+                detail="stock movement already reversed",
+            )
+
+        conn.execute(
+            "UPDATE stock_movements SET status=? WHERE tenant=? AND movement_id=?",
+            (REVERSED, tenant, movement_id),
+        )
+        body = {
+            "movement_id": movement_id,
+            "order_id": row["order_id"],
+            "direction": row["direction"],
+            "quantity": row["quantity"],
+            "status": REVERSED,
+            "created_at": row["created_at"],
+        }
+        store_outcome(conn, tenant=tenant, operation=REVERSE_OP, target_id=movement_id,
+                      fingerprint=fingerprint, code="ok", status=200, detail="",
+                      body=body)
+        conn.execute("COMMIT")
+        return Outcome.ok(body)
     finally:
         conn.close()
 
@@ -141,10 +210,14 @@ def decode_cursor(cursor: str) -> tuple[str, str]:
 def search(tenant: str, *, order_id: str | None = None, direction: str | None = None,
            quantity_min: int | None = None, quantity_max: int | None = None,
            created_from: str | None = None, created_to: str | None = None,
+           status: str | None = None, include_reversed: bool = False,
            cursor: str | None = None, limit: int = DEFAULT_PAGE_LIMIT) -> dict:
     """List a tenant's movements under an arbitrary AND-combination of filters.
 
-    Ranges are inclusive. Ordering is created_at ASC then movement_id ASC, which
+    Ranges are inclusive. Reversed movements are hidden unless requested:
+    without ``status`` and without ``include_reversed`` only ``accepted``
+    movements are listed; ``status`` filters exactly; ``include_reversed``
+    lists every status. Ordering is created_at ASC then movement_id ASC, which
     is independent of insertion order and stable across repeated queries.
     Keyset pagination positions the cursor at the last row of the previous page
     in exactly that ordering, so pages never repeat or skip a row and the union
@@ -158,6 +231,12 @@ def search(tenant: str, *, order_id: str | None = None, direction: str | None = 
     if direction is not None:
         clauses.append("direction=?")
         params.append(direction)
+    if status is not None:
+        clauses.append("status=?")
+        params.append(status)
+    elif not include_reversed:
+        clauses.append("status=?")
+        params.append(ACCEPTED)
     if quantity_min is not None:
         clauses.append("quantity>=?")
         params.append(quantity_min)
