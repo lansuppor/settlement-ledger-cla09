@@ -1,10 +1,13 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from fastapi import FastAPI, Header, HTTPException, Query, Response
+from pydantic import BaseModel, Field, StrictInt
+
 from app.config import tenant_header
-from app.store import order_imports, orders, reconciliations, refunds, settlements, tickets
-from app.store.db import connect, migrate
 from app.rules import order_rules
+from app.store import order_imports, orders, reconciliations, refunds, settlements, stock_movements, tickets
+from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
 
@@ -46,6 +49,12 @@ class TicketResolutionIn(BaseModel):
 class OrderImportIn(BaseModel):
     task_id: str = Field(min_length=1)
     csv_content: str = Field(min_length=1)
+
+class StockMovementIn(BaseModel):
+    movement_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    direction: Literal["in", "out"]
+    quantity: StrictInt = Field(gt=0)
 
 @app.get("/health")
 def health() -> dict:
@@ -260,6 +269,53 @@ def resume_order_import(task_id: str, x_tenant: str = Header(default="")) -> dic
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
     return _render(order_imports.resume(x_tenant, task_id))
+
+@app.post("/stock-movements", status_code=201)
+def create_stock_movement(body: StockMovementIn, x_tenant: str = Header(default=""),
+                          idempotency_key: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency-key header is required")
+    outcome = stock_movements.accept(x_tenant, body.movement_id, body.order_id,
+                                     body.direction, body.quantity, idempotency_key)
+    return _render(outcome)
+
+@app.get("/stock-movements/{movement_id}")
+def read_stock_movement(movement_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    movement = stock_movements.get(x_tenant, movement_id)
+    if movement is None:
+        raise HTTPException(status_code=404, detail="stock movement not found")
+    return movement
+
+@app.get("/stock-movements")
+def list_stock_movements(
+    x_tenant: str = Header(default=""),
+    order_id: str | None = Query(default=None),
+    direction: Literal["in", "out"] | None = Query(default=None),
+    quantity_min: int | None = Query(default=None, ge=1),
+    quantity_max: int | None = Query(default=None, ge=1),
+    created_from: str | None = Query(default=None),
+    created_to: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=stock_movements.DEFAULT_PAGE_LIMIT, ge=1,
+                       le=stock_movements.MAX_PAGE_LIMIT),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if quantity_min is not None and quantity_max is not None and quantity_min > quantity_max:
+        raise HTTPException(status_code=400, detail="quantity_min must not be greater than quantity_max")
+    try:
+        return stock_movements.search(
+            x_tenant, order_id=order_id, direction=direction,
+            quantity_min=quantity_min, quantity_max=quantity_max,
+            created_from=created_from, created_to=created_to,
+            cursor=cursor, limit=limit,
+        )
+    except stock_movements.InvalidCursor:
+        raise HTTPException(status_code=400, detail="cursor is invalid")
 
 def main() -> None:
     parser = argparse.ArgumentParser()
