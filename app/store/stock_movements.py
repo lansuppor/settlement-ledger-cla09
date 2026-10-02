@@ -208,6 +208,74 @@ def decode_cursor(cursor: str) -> tuple[str, str]:
     return created_at, movement_id
 
 
+def encode_summary_cursor(order_id: str) -> str:
+    raw = json.dumps({"order_id": order_id}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def decode_summary_cursor(cursor: str) -> str:
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        order_id = payload["order_id"]
+    except Exception as error:
+        raise InvalidCursor("cursor is invalid") from error
+    if not isinstance(order_id, str) or not order_id:
+        raise InvalidCursor("cursor is invalid")
+    return order_id
+
+
+def summary(tenant: str, *, order_id: str | None = None, cursor: str | None = None,
+            limit: int = DEFAULT_PAGE_LIMIT) -> dict:
+    """Aggregate net quantities per order for a tenant, read-only.
+
+    Net per order = SUM(quantity of in, accepted) - SUM(quantity of out,
+    accepted); reversed movements count 0 whatever their direction, so the
+    summary always equals replaying every movement of the order by status.
+    Only orders that have at least one movement appear (an order whose
+    movements are all reversed still appears, with net 0).
+
+    Ordering is order_id ASC, independent of insertion order and stable across
+    repeated queries. Keyset pagination positions the cursor at the last
+    order_id of the previous page and continues strictly after it, so pages
+    never repeat or skip an order and the union of pages in any order equals
+    the full result set. With ``order_id`` given the result is that single
+    order's row (empty when it has no movements; the caller maps that to an
+    error that does not leak whether the order exists). A cursor is always
+    validated when supplied but only positions the aggregate-all walk.
+    """
+    cursor_order_id = decode_summary_cursor(cursor) if cursor is not None else None
+
+    clauses = ["tenant=?"]
+    params: list[object] = [tenant]
+    if order_id is not None:
+        clauses.append("order_id=?")
+        params.append(order_id)
+    elif cursor_order_id is not None:
+        clauses.append("order_id>?")
+        params.append(cursor_order_id)
+
+    sql = (
+        "SELECT order_id, "
+        "COALESCE(SUM(CASE WHEN direction='in' AND status='accepted' THEN quantity ELSE 0 END),0)"
+        " - COALESCE(SUM(CASE WHEN direction='out' AND status='accepted' THEN quantity ELSE 0 END),0)"
+        " AS net_quantity "
+        f"FROM stock_movements WHERE {' AND '.join(clauses)} "
+        "GROUP BY order_id ORDER BY order_id ASC LIMIT ?"
+    )
+
+    conn = connect()
+    try:
+        rows = conn.execute(sql, (*params, limit + 1)).fetchall()
+    finally:
+        conn.close()
+
+    has_more = len(rows) > limit
+    page = [{"order_id": row["order_id"], "net_quantity": row["net_quantity"]}
+            for row in rows[:limit]]
+    next_cursor = encode_summary_cursor(page[-1]["order_id"]) if has_more else None
+    return {"items": page, "next_cursor": next_cursor}
+
+
 def search(tenant: str, *, order_id: str | None = None, direction: str | None = None,
            quantity_min: int | None = None, quantity_max: int | None = None,
            created_from: str | None = None, created_to: str | None = None,

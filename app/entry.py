@@ -281,6 +281,27 @@ def create_stock_movement(body: StockMovementIn, x_tenant: str = Header(default=
                                      body.direction, body.quantity, idempotency_key)
     return _render(outcome)
 
+@app.get("/stock-movements/summary")
+def summarize_stock_movements(
+    x_tenant: str = Header(default=""),
+    order_id: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=stock_movements.DEFAULT_PAGE_LIMIT, ge=1,
+                       le=stock_movements.MAX_PAGE_LIMIT),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = stock_movements.summary(x_tenant, order_id=order_id,
+                                         cursor=cursor, limit=limit)
+    except stock_movements.InvalidCursor:
+        raise HTTPException(status_code=400, detail="cursor is invalid")
+    if order_id is not None and not result["items"]:
+        # Same response whether the order is missing, cross-tenant or simply
+        # has no movements: nothing about the order's existence leaks.
+        raise HTTPException(status_code=400, detail="no stock movement summary for order")
+    return result
+
 @app.get("/stock-movements/{movement_id}")
 def read_stock_movement(movement_id: str, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:
