@@ -94,7 +94,8 @@ def test_imported_order_works_on_all_chains() -> None:
     submit("t1", "task-chain", csv)
     h = {"X-Tenant": "t1"}
     # 收款
-    assert client.post("/orders/chain-1/payments", json={"amount_cents": 1000}, headers=h).status_code == 200
+    assert client.post("/orders/chain-1/payments", json={"amount_cents": 1000},
+                       headers={**h, "Idempotency-Key": "chain-pay-1"}).status_code == 200
     # 退款受理 + 读取
     r = client.post("/refunds", json={"refund_id": "rf-chain", "order_id": "chain-1",
                                       "amount_cents": 300, "reason": "x"},
