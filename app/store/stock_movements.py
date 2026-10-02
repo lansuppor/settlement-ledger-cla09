@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import sqlite3
 
 from app.store.db import connect
@@ -389,6 +390,87 @@ def summary(tenant: str, *, order_id: str | None = None, cursor: str | None = No
     page = [{"order_id": row["order_id"], "net_quantity": row["net_quantity"]}
             for row in rows[:limit]]
     next_cursor = encode_summary_cursor(page[-1]["order_id"]) if has_more else None
+    return {"items": page, "next_cursor": next_cursor}
+
+
+# A movement's month is the year-month of its (UTC ISO) created_at prefix; the
+# prefix is fixed when the movement is accepted and never changes afterwards
+# (reversal keeps created_at), so month membership is accepted once and stable.
+_MONTH_EXPR = "substr(created_at,1,7)"
+_MONTH_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
+
+
+def encode_monthly_cursor(order_id: str, month: str) -> str:
+    raw = json.dumps({"order_id": order_id, "month": month}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def decode_monthly_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        order_id = payload["order_id"]
+        month = payload["month"]
+    except Exception as error:
+        raise InvalidCursor("cursor is invalid") from error
+    if (not isinstance(order_id, str) or not order_id
+            or not isinstance(month, str) or not _MONTH_RE.match(month)):
+        raise InvalidCursor("cursor is invalid")
+    return order_id, month
+
+
+def monthly_summary(tenant: str, *, order_id: str | None = None, cursor: str | None = None,
+                    limit: int = DEFAULT_PAGE_LIMIT) -> dict:
+    """Aggregate this tenant's movements into per-(order, month) net quantities.
+
+    Each entry is one order in one month: ``net_quantity`` = SUM(quantity of in,
+    accepted that month) - SUM(quantity of out, accepted that month); reversed
+    movements count 0 but the (order, month) group still exists as long as the
+    order has a movement in that month. Month is the ``YYYY-MM`` prefix of the
+    movement's created_at (UTC ISO), fixed at acceptance and never changed by
+    reversal. With ``order_id`` only that order's month rows are returned, or
+    ``OrderSummaryNotFound`` when it has no movements (indistinguishable from a
+    missing/cross-tenant order). Without ``order_id`` every (order, month) that
+    has movements is listed, ordered by order_id ASC then month ASC — stable
+    regardless of insertion order and across repeated queries. Keyset
+    pagination positions the cursor at the last (order_id, month) of the
+    previous page and continues strictly after it in exactly that ordering, so
+    pages never repeat or skip an entry and the union of pages in any order
+    equals the full result set; the per-month nets of one order always sum to
+    that order's net in :func:`summary`. Read-only: never changes any document.
+    """
+    clauses = ["tenant=?"]
+    params: list[object] = [tenant]
+    if order_id is not None:
+        clauses.append("order_id=?")
+        params.append(order_id)
+    if cursor is not None:
+        cur_order_id, cur_month = decode_monthly_cursor(cursor)
+        clauses.append(f"(order_id>? OR (order_id=? AND {_MONTH_EXPR}>?))")
+        params.extend((cur_order_id, cur_order_id, cur_month))
+
+    sql = (
+        f"SELECT order_id, {_MONTH_EXPR} AS month, "
+        "COALESCE(SUM(CASE WHEN status='accepted' AND direction='in' THEN quantity "
+        "WHEN status='accepted' AND direction='out' THEN -quantity "
+        "ELSE 0 END), 0) AS net_quantity "
+        f"FROM stock_movements WHERE {' AND '.join(clauses)} "
+        f"GROUP BY order_id, {_MONTH_EXPR} ORDER BY order_id ASC, month ASC LIMIT ?"
+    )
+
+    conn = connect()
+    try:
+        rows = conn.execute(sql, (*params, limit + 1)).fetchall()
+    finally:
+        conn.close()
+
+    if order_id is not None and not rows:
+        raise OrderSummaryNotFound("order has no stock movement summary")
+
+    has_more = len(rows) > limit
+    page = [{"order_id": row["order_id"], "month": row["month"],
+             "net_quantity": row["net_quantity"]} for row in rows[:limit]]
+    next_cursor = (encode_monthly_cursor(page[-1]["order_id"], page[-1]["month"])
+                   if has_more else None)
     return {"items": page, "next_cursor": next_cursor}
 
 
