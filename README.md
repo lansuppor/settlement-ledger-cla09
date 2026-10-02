@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；退款单的受理、读取、冲正与幂等重放；结算单的受理、读取、推进（把引用的待处理退款原子推进为已生效）与撤销（解除已生效结算单的全部核销，退款回到待处理）；订单对账（按订单核对已收、退款与已生效结算合计并留痕，不改变任何单据状态）；以及异常工单的登记、读取、处理、解决与关闭（把异常处理诉求登记成可跟踪的独立单据，解决受对账未结清冲突约束）。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；订单批量导入（以可校验、可断点续跑的导入任务逐行受理订单，支持重复重放与并发冲突区分）；退款单的受理、读取、冲正与幂等重放；结算单的受理、读取、推进（把引用的待处理退款原子推进为已生效）与撤销（解除已生效结算单的全部核销，退款回到待处理）；订单对账（按订单核对已收、退款与已生效结算合计并留痕，不改变任何单据状态）；以及异常工单的登记、读取、处理、解决与关闭（把异常处理诉求登记成可跟踪的独立单据，解决受对账未结清冲突约束）。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -36,6 +36,17 @@
 - `POST /tickets/{ticket_id}/process`：处理工单。把待处理（`pending`）工单推进为处理中（`processing`）；对已处于 `processing` 的工单处理为幂等成功（不再次翻转、不改变更新时间）；已解决（`resolved`）或已关闭（`closed`）工单处理返回 409 且不改变状态；不存在或跨租户返回 404。需带 `Idempotency-Key`。
 - `POST /tickets/{ticket_id}/resolve`：解决工单。把 `pending` 或 `processing` 工单置为 `resolved`，并记录请求字段 `resolution_note`（解决说明，非空）。已关闭工单解决返回 409；对已解决工单再次解决返回 409。**对账未结清冲突**：若该工单所属订单存在结论为不符（`mismatched`）且已完成（`completed`）的对账批次（以最新一条已完成批次的结论为准），解决被拒绝返回 409 且不改变工单状态；需先以新批次重新对账得到相符（`balanced`）结论后才可解决。已关闭工单不受此限制。不存在或跨租户返回 404。需带 `Idempotency-Key`。
 - `POST /tickets/{ticket_id}/close`：关闭工单。把 `pending`、`processing` 或 `resolved` 工单置为终态 `closed`，返回 200；对已关闭工单重复关闭返回 409 且不改变状态；不存在或跨租户返回 404。需带 `Idempotency-Key`。
+- `POST /order-imports`：提交订单批量导入任务。请求字段 `task_id`（导入任务标识）与 `csv_content`（CSV 文本，表头须为 `tenant,order_id,amount_cents,currency`，与 `fixtures/orders.csv` 一致，其后每行一条订单：租户、订单标识、金额、币种）。任务受理后立即同步逐行校验与受理，成功返回 201 与任务结果。每行独立判定：金额须为正整数、币种须受支持（`CNY`/`USD`/`EUR`/`JPY`）、订单标识在该租户下尚未存在；合格行受理为 `accepted` 订单（字段与 `POST /orders` 一致），不合格行不受理、只记录错误原因。同批完全相同的重复行只受理先到一行，其余记 `duplicate row in import`；不同内容共用同一订单标识也只受理先到一行，其余记 `duplicate order_id in import`。单行失败不影响其他行。参数不合法（空内容、表头不符、无数据行等）返回 400 且不留任务；同一任务标识不同内容（并发或先后）只允许一个生效，其余返回 409 且不改变已存在任务与订单。
+- `GET /order-imports/{task_id}`：按任务标识读取导入任务，返回 `task_id`、`status`（`in_progress`/`completed`）、`total_rows`、`success_count`、`failure_count`、`processed_rows`、`errors`（逐条 `line_no`/`raw`/`reason`，行号按数据区从 1 起计）与 `created_at`、`completed_at`；任务不存在返回 404。导入任务跨 CSV 内多租户，不使用 `X-Tenant` 头隔离。
+- `POST /order-imports/{task_id}/run`：断点续跑。继续同一任务，只处理尚未判定的行：不重复受理已成功行、不重复记录已判失败行，全部处理完任务进入 `completed`，返回 200 与最新任务视图；对已完成任务为幂等成功（返回同一结果）；任务不存在返回 404。
+
+### 订单批量导入说明
+
+- 每行在各自的单事务内判定：合格行同事务写入订单并把行置为成功；不合格行只把行置为失败并记录原因。整批执行中断（如服务中断）时已提交行保留、正在处理的一行整体回滚（不留半行结果），任务保持 `in_progress`；调用 `/run` 续跑只处理剩余行，最终各计数与错误清单与一次性成功导入完全一致，每行要么被受理一次、要么被判失败一次，且 成功数 + 失败数 = 已处理数，全部完成时 已处理数 = 总行数。
+- 同一任务标识重复提交相同内容返回与首次完全相同的业务结果（含首次错误清单），不产生第二次导入或第二次受理；去重状态持久化落库，服务重启后同一请求仍识别为重放（未完成则自动续跑剩余行）。同一任务标识不同内容并发或先后提交时仅一个生效，其余 409 且不改变已存在任务与订单数据。
+- 导入受理的订单与逐单受理订单在读取、收款、退款、结算与对账各链路上行为完全一致；跨租户读取导入的订单仍按不存在处理。
+- 错误可区分：参数不合法 400（detail 说明 CSV/行问题）；任务不存在 404（`import task not found`）；同一任务标识不同内容的**重复受理** 409（先后提交，`import task already accepted with different content`）与**并发冲突** 409（与正在执行的首跑并发，`a concurrent submission for the same task id with different content is in progress`）；服务内部错误 500。同内容重放（含并发）恒返回首次 201 结果，不会落到 409。
+
 
 ### 工单与对账未结清说明
 
@@ -122,6 +133,16 @@ curl -s -X POST localhost:8000/tickets/w1/resolve \
 # 关闭：任意非终态 -> 已关闭（终态）
 curl -s -X POST localhost:8000/tickets/w1/close \
   -H 'X-Tenant: t1' -H 'Idempotency-Key: tkt-close-0001'
+
+# 提交订单批量导入任务（表头与 fixtures/orders.csv 一致，逐行 租户,订单标识,金额,币种）
+curl -s -X POST localhost:8000/order-imports -H 'Content-Type: application/json' \
+  -d '{"task_id":"imp-0001","csv_content":"tenant,order_id,amount_cents,currency\nt1,o1,1200,CNY\nt1,o2,800,CNY\nt2,o3,4500,USD\n"}'
+
+# 按任务标识读取导入结果（错误清单逐条给出行号、原始行与原因）
+curl -s localhost:8000/order-imports/imp-0001
+
+# 断点续跑：服务中断后继续同一任务，只处理尚未判定的行（已完成任务为幂等成功）
+curl -s -X POST localhost:8000/order-imports/imp-0001/run
 ```
 - `GET /health`：返回服务与数据库状态。
 
@@ -134,6 +155,5 @@ curl -s -X POST localhost:8000/tickets/w1/close \
 
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
-- 无缓存层；批量导入只支持小样本同步方式。
 - 收款只支持整单登记，未实现分期。
 - 退款受理后为待处理（`pending`），由结算推进（`POST /settlements` + `/advance`）原子推进为已生效（`effective`）；服务自身不做自动结算。

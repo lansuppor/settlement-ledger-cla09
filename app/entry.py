@@ -2,7 +2,7 @@ import argparse
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from app.config import tenant_header
-from app.store import orders, reconciliations, refunds, settlements, tickets
+from app.store import order_imports, orders, reconciliations, refunds, settlements, tickets
 from app.store.db import connect, migrate
 from app.rules import order_rules
 
@@ -42,6 +42,10 @@ class TicketIn(BaseModel):
 
 class TicketResolutionIn(BaseModel):
     resolution_note: str = Field(min_length=1)
+
+class OrderImportIn(BaseModel):
+    task_id: str = Field(min_length=1)
+    csv_content: str = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -225,6 +229,23 @@ def close_ticket(ticket_id: str, x_tenant: str = Header(default=""),
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="idempotency-key header is required")
     outcome = tickets.close(x_tenant, ticket_id, idempotency_key)
+    return _render(outcome)
+
+@app.post("/order-imports", status_code=201)
+def create_order_import(body: OrderImportIn) -> dict:
+    outcome = order_imports.submit(body.task_id, body.csv_content)
+    return _render(outcome)
+
+@app.get("/order-imports/{task_id}")
+def read_order_import(task_id: str) -> dict:
+    task = order_imports.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="import task not found")
+    return task
+
+@app.post("/order-imports/{task_id}/run", status_code=200)
+def run_order_import(task_id: str) -> dict:
+    outcome = order_imports.resume(task_id)
     return _render(outcome)
 
 def _render(outcome) -> dict:
