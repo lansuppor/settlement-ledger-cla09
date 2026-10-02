@@ -2,7 +2,7 @@ import argparse
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from app.config import tenant_header
-from app.store import orders, reconciliations, refunds, settlements, tickets
+from app.store import order_imports, orders, reconciliations, refunds, settlements, tickets
 from app.store.db import connect, migrate
 from app.rules import order_rules
 
@@ -42,6 +42,10 @@ class TicketIn(BaseModel):
 
 class TicketResolutionIn(BaseModel):
     resolution_note: str = Field(min_length=1)
+
+class OrderImportIn(BaseModel):
+    task_id: str = Field(min_length=1)
+    csv_content: str = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -231,6 +235,31 @@ def _render(outcome) -> dict:
     if outcome.code != "ok":
         raise HTTPException(status_code=outcome.status, detail=outcome.detail)
     return outcome.body
+
+@app.post("/order-imports", status_code=201)
+def create_order_import(body: OrderImportIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        outcome = order_imports.accept(x_tenant, body.task_id, body.csv_content)
+    except order_imports.InvalidImportRequest as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return _render(outcome)
+
+@app.get("/order-imports/{task_id}")
+def read_order_import(task_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    task = order_imports.get(x_tenant, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="import task not found")
+    return task
+
+@app.post("/order-imports/{task_id}/resume", status_code=200)
+def resume_order_import(task_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    return _render(order_imports.resume(x_tenant, task_id))
 
 def main() -> None:
     parser = argparse.ArgumentParser()
