@@ -30,6 +30,11 @@ INVALID_PARAM = "invalid_param"
 ACCEPT_OP = "stock_movement_accept"
 REVERSE_OP = "stock_movement_reverse"
 
+# Event-stream operation labels (the public audit trail uses English tokens,
+# the same convention as status/direction).
+ACCEPT_EVENT = "accept"
+REVERSE_EVENT = "reverse"
+
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 500
 
@@ -61,6 +66,34 @@ _SELECT = (
     "SELECT movement_id, order_id, direction, quantity, status, created_at "
     "FROM stock_movements"
 )
+
+_EVENT_SELECT = (
+    "SELECT occurred_at, operation, status, seq, direction, quantity "
+    "FROM stock_movement_events"
+)
+
+
+def _append_event(conn: sqlite3.Connection, *, tenant: str, movement_id: str,
+                  operation: str, status: str, direction: str, quantity: int,
+                  occurred_at: str) -> None:
+    """Append an audit row inside the caller's (already open) transaction.
+
+    The sequence number continues per movement from 1; accept is always 1 and
+    reverse — if it ever happens — is 2. A per-movement unique index on
+    operation is the backstop that keeps each event to at most one row, so the
+    audit trail can never disagree with how many operations took effect.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq "
+        "FROM stock_movement_events WHERE tenant=? AND movement_id=?",
+        (tenant, movement_id),
+    ).fetchone()
+    conn.execute(
+        "INSERT INTO stock_movement_events(tenant, movement_id, seq, operation, status, "
+        "direction, quantity, occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+        (tenant, movement_id, row["next_seq"], operation, status,
+         direction, quantity, occurred_at),
+    )
 
 
 def get(tenant: str, movement_id: str) -> dict | None:
@@ -122,6 +155,9 @@ def accept(tenant: str, movement_id: str, order_id: str, direction: str,
             "VALUES(?,?,?,?,?,?,?)",
             (tenant, movement_id, order_id, direction, quantity, ACCEPTED, created_at),
         )
+        _append_event(conn, tenant=tenant, movement_id=movement_id, operation=ACCEPT_EVENT,
+                      status=ACCEPTED, direction=direction, quantity=quantity,
+                      occurred_at=created_at)
         body = {
             "movement_id": movement_id,
             "order_id": order_id,
@@ -181,6 +217,9 @@ def reverse(tenant: str, movement_id: str, fingerprint: str) -> Outcome:
             "UPDATE stock_movements SET status=? WHERE tenant=? AND movement_id=?",
             (REVERSED, tenant, movement_id),
         )
+        _append_event(conn, tenant=tenant, movement_id=movement_id, operation=REVERSE_EVENT,
+                      status=REVERSED, direction=row["direction"], quantity=row["quantity"],
+                      occurred_at=now_iso())
         body = {
             "movement_id": movement_id,
             "order_id": row["order_id"],
@@ -351,3 +390,41 @@ def summary(tenant: str, *, order_id: str | None = None, cursor: str | None = No
             for row in rows[:limit]]
     next_cursor = encode_summary_cursor(page[-1]["order_id"]) if has_more else None
     return {"items": page, "next_cursor": next_cursor}
+
+
+def events(tenant: str, movement_id: str) -> list[dict] | None:
+    """Return a movement's audit trail ordered by (occurred_at ASC, seq ASC).
+
+    ``None`` means the movement does not exist for this tenant (including a
+    movement that belongs to another tenant), so the caller answers 404 without
+    leaking existence. An existing movement that was never acted on cannot
+    occur (accept always writes its event in the same transaction), but an empty
+    list is returned rather than erroring. Read-only: never changes any
+    document, task or order.
+    """
+    conn = connect()
+    try:
+        owner = conn.execute(
+            "SELECT 1 FROM stock_movements WHERE tenant=? AND movement_id=?",
+            (tenant, movement_id),
+        ).fetchone()
+        if owner is None:
+            return None
+        rows = conn.execute(
+            f"{_EVENT_SELECT} WHERE tenant=? AND movement_id=? "
+            "ORDER BY occurred_at ASC, seq ASC",
+            (tenant, movement_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "occurred_at": row["occurred_at"],
+            "operation": row["operation"],
+            "status": row["status"],
+            "seq": row["seq"],
+            "direction": row["direction"],
+            "quantity": row["quantity"],
+        }
+        for row in rows
+    ]

@@ -308,6 +308,15 @@ def read_stock_movement(movement_id: str, x_tenant: str = Header(default="")) ->
         raise HTTPException(status_code=404, detail="stock movement not found")
     return movement
 
+@app.get("/stock-movements/{movement_id}/events")
+def read_stock_movement_events(movement_id: str, x_tenant: str = Header(default="")) -> list:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    trail = stock_movements.events(x_tenant, movement_id)
+    if trail is None:
+        raise HTTPException(status_code=404, detail="stock movement not found")
+    return trail
+
 @app.post("/stock-movements/{movement_id}/reverse", status_code=200)
 def reverse_stock_movement(movement_id: str, x_tenant: str = Header(default=""),
                            idempotency_key: str = Header(default="")) -> dict:
