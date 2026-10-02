@@ -28,6 +28,8 @@
 - `POST /refunds`：受理退款单。请求字段 `refund_id`、`order_id`、`amount_cents`、`reason`；租户经 `X-Tenant` 传入，幂等键经 `Idempotency-Key` 请求头传入（必填）。受理成功返回 201，退款单为 `pending`。参数不合法（金额非正整数/超过订单金额）返回 400/422；订单不存在或跨租户返回 404（不泄漏对象是否存在）；退款标识重复受理返回 409；超过可退金额返回 409。
 - `GET /refunds/{refund_id}`：按标识读取退款单，返回 `refund_id`、`order_id`、`amount_cents`、`reason`、`status`、`created_at`；租户经 `X-Tenant` 隔离，不存在或跨租户返回 404。
 - `POST /refunds/{refund_id}/reverse`：冲正退款单。对待处理（`pending`）或已生效（`effective`）退款单冲正后进入终态 `reversed` 并立即释放可退额度，返回 200；对已冲正退款单重复冲正返回 409 且不改变状态；不存在或跨租户返回 404。需带 `Idempotency-Key`。
+- `GET /refunds`：条件检索本租户退款单（只读）。查询参数可任意组合（条件之间为逻辑与、区间含端点）：`order_id`、`status`（精确过滤，仅 `pending`/`effective`/`reversed`）、`amount_min`、`amount_max`（正整数，`amount_min` 不得大于 `amount_max`）、`created_from`、`created_to`（ISO 时间，含端点）、`include_reversed`（布尔，`true` 返回全部状态）、`cursor`（上一页返回的续页游标）、`limit`（每页上限，默认 100、最大 500，须为正整数）。状态可见性：`status` 与 `include_reversed` 都不传时默认只返回 `pending` 与 `effective`；`include_reversed=true` 返回全部；两者同时给出返回 400。返回 `{"items":[...],"next_cursor":...}`，每条字段与按标识读取一致；按创建时间升序、相同则按退款标识升序排序，顺序不受插入先后与重复查询影响。结果数超过当前页上限时返回不透明 `next_cursor` 续取，否则为 `null`；游标指向上页末条在该排序中的位置，任意分页大小与取页顺序下各页并集恰等于完整结果集，不重复不漏项。检索按租户隔离，空结果返回空列表 `items` 且 `next_cursor` 为 `null`；租户头缺失或参数不合法（含 `status` 非法、`include_reversed` 非布尔、区间反向、`limit` 非法）返回 400/422，游标非法返回 400。
+- `GET /refunds/summary`：按订单聚合本租户退款单的可退金额（只读）。查询参数 `order_id`（可选，指定单个订单标识，仅在该订单存在退款单时返回该订单的一条汇总）、`limit`（可选，每页订单数上限，默认 100、最大 500，须为正整数）与 `cursor`（可选，续页游标）。`order_id` 不传时汇总本租户全部有退款单的订单，按订单标识升序稳定排序，顺序不受插入先后与重复查询影响。返回 `{"items":[{"order_id":...,"refundable_cents":...}],"next_cursor":...}`：`refundable_cents` 为可退金额 = 该订单已收金额 −（待处理 + 已生效）退款合计，冲正（`reversed`）退款不占额度。结果数超过当页 `limit` 时返回不透明 `next_cursor` 续取，否则（含空结果）为 `null`；游标指向上页末条订单标识的位置，页内严格按订单标识大于该位置续取，任意分页大小与任意取页顺序下各页并集恰等于完整结果集，不重复不漏项。空结果返回空 `items` 且 `next_cursor` 为 `null`；租户头缺失、`limit` 非法或游标非法返回 400/422；`order_id` 指定的订单没有退款单时返回 400，与订单不存在不可区分（不泄漏该订单是否存在）。汇总口径与单据操作一致：受理、冲正、结算推进与结算撤销后，同一订单的可退金额恒等于该订单全部退款单逐张按状态计入的结果；汇总为只读查询，不改变订单、退款单、结算单、对账批次、工单与批量导入任务的状态、金额与结论，与退款检索各自独立、互不影响。
 - `POST /settlements`：受理结算单。请求字段 `settlement_id`、`order_id`、`amount_cents`（最小货币单位正整数）、`refund_ids`（非空、去重的退款标识集合）、`reason`；租户经 `X-Tenant` 传入，`Idempotency-Key` 必填。成功返回 201，结算单为 `pending`；参数不合法返回 400/422；订单不存在或跨租户返回 404（不泄漏对象是否存在）；结算标识重复受理返回 409。
 - `GET /settlements/{settlement_id}`：按标识读取结算单，返回 `settlement_id`、`order_id`、`amount_cents`、`refund_ids`、`reason`、`status`、`created_at`、`updated_at`；租户经 `X-Tenant` 隔离，不存在或跨租户返回 404。
 - `POST /settlements/{settlement_id}/advance`：结算推进。原子地把引用的待处理退款全部置为 `effective` 且结算单进入 `effective`，返回 200；任一引用不满足则全部保持原状并返回可区分错误：引用退款不存在（含属于其他订单者）404，已被其他结算单核销 409，已冲正 409，结算金额与引用退款合计不符 409；结算单不存在或跨租户 404；已生效结算单重复推进 409；对已撤销结算单推进 409。需带 `Idempotency-Key`，同一（租户、操作、结算单标识、请求指纹）重放返回首次结果（含首次错误）；不同幂等键并发推进同一结算单仅一个成功，其余 409。
@@ -114,6 +116,15 @@ curl -s -X POST localhost:8000/refunds -H 'X-Tenant: t1' -H 'Idempotency-Key: rf
 
 # 读取退款单
 curl -s localhost:8000/refunds/r1 -H 'X-Tenant: t1'
+
+# 条件检索退款单（只读；默认只返回 pending/effective，include_reversed=true 返回全部）
+curl -s 'localhost:8000/refunds?order_id=o1&amount_min=100&amount_max=500&limit=100' -H 'X-Tenant: t1'
+# 续页：带上上一页返回的 next_cursor
+curl -s 'localhost:8000/refunds?order_id=o1&cursor=<上一页next_cursor>' -H 'X-Tenant: t1'
+
+# 按订单聚合可退金额（只读）；指定 order_id 时该订单无退款单则返回 400
+curl -s 'localhost:8000/refunds/summary?order_id=o1' -H 'X-Tenant: t1'
+curl -s 'localhost:8000/refunds/summary?limit=100' -H 'X-Tenant: t1'
 
 # 冲正退款单（释放可退额度）
 curl -s -X POST localhost:8000/refunds/r1/reverse \
