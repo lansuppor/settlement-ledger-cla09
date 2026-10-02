@@ -38,6 +38,14 @@ class InvalidCursor(Exception):
     """The pagination cursor is malformed or was not issued by this service."""
 
 
+class OrderSummaryNotFound(Exception):
+    """The requested order has no stock movements (or does not exist here).
+
+    Raised for the single-order summary lookup; the two cases are deliberately
+    indistinguishable so the response never leaks whether the order exists.
+    """
+
+
 def _row_to_body(row: sqlite3.Row) -> dict:
     return {
         "movement_id": row["movement_id"],
@@ -271,4 +279,75 @@ def search(tenant: str, *, order_id: str | None = None, direction: str | None = 
     has_more = len(rows) > limit
     page = [_row_to_body(row) for row in rows[:limit]]
     next_cursor = encode_cursor(page[-1]["created_at"], page[-1]["movement_id"]) if has_more else None
+    return {"items": page, "next_cursor": next_cursor}
+
+
+def encode_summary_cursor(order_id: str) -> str:
+    raw = json.dumps({"order_id": order_id}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def decode_summary_cursor(cursor: str) -> str:
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        order_id = payload["order_id"]
+    except Exception as error:
+        raise InvalidCursor("cursor is invalid") from error
+    if not isinstance(order_id, str) or not order_id:
+        raise InvalidCursor("cursor is invalid")
+    return order_id
+
+
+def summary(tenant: str, *, order_id: str | None = None, cursor: str | None = None,
+            limit: int = DEFAULT_PAGE_LIMIT) -> dict:
+    """Aggregate this tenant's movements into a per-order net-quantity summary.
+
+    ``net_quantity`` per order = SUM(quantity of in, accepted)
+    - SUM(quantity of out, accepted); reversed movements count 0 regardless of
+    their original direction, so the summary always equals the per-movement
+    tally after any accept/reverse/replay sequence. With ``order_id`` the
+    single matching row is returned, or ``OrderSummaryNotFound`` when the order
+    has no movements (indistinguishable from a missing/cross-tenant order).
+    Without ``order_id`` every order that has movements is listed, ordered by
+    order_id ASC — independent of insertion order and stable across repeated
+    queries. Keyset pagination positions the cursor at the last order_id of
+    the previous page and continues strictly after it, so pages never repeat
+    or skip an order and the union of pages in any order equals the full
+    result set. Read-only: never changes any document.
+    """
+    clauses = ["tenant=?"]
+    params: list[object] = [tenant]
+    if order_id is not None:
+        clauses.append("order_id=?")
+        params.append(order_id)
+    elif cursor is not None:
+        clauses.append("order_id>?")
+        params.append(decode_summary_cursor(cursor))
+
+    sql = (
+        "SELECT order_id, "
+        "SUM(CASE WHEN status='accepted' AND direction='in' THEN quantity "
+        "WHEN status='accepted' AND direction='out' THEN -quantity "
+        "ELSE 0 END) AS net_quantity "
+        f"FROM stock_movements WHERE {' AND '.join(clauses)} "
+        "GROUP BY order_id ORDER BY order_id ASC LIMIT ?"
+    )
+
+    conn = connect()
+    try:
+        rows = conn.execute(sql, (*params, limit + 1)).fetchall()
+    finally:
+        conn.close()
+
+    if order_id is not None:
+        if not rows:
+            raise OrderSummaryNotFound("order has no stock movement summary")
+        row = rows[0]
+        return {"items": [{"order_id": row["order_id"], "net_quantity": row["net_quantity"]}],
+                "next_cursor": None}
+
+    has_more = len(rows) > limit
+    page = [{"order_id": row["order_id"], "net_quantity": row["net_quantity"]}
+            for row in rows[:limit]]
+    next_cursor = encode_summary_cursor(page[-1]["order_id"]) if has_more else None
     return {"items": page, "next_cursor": next_cursor}
