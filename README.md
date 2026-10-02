@@ -45,6 +45,7 @@
 - `GET /stock-movements`：条件检索本租户出入库单。查询参数可任意组合（条件之间为逻辑与、区间含端点）：`order_id`、`direction`（`in`/`out`）、`quantity_min`、`quantity_max`（正整数，`quantity_min` 不得大于 `quantity_max`）、`created_from`、`created_to`（ISO 时间，含端点）、`status`（精确过滤，仅 `accepted`/`reversed`）、`include_reversed`（布尔，`true` 返回全部状态）、`cursor`（上一页返回的续页游标）、`limit`（每页上限，默认 100、最大 500，须为正整数）。状态可见性：`status` 与 `include_reversed` 都不传时默认只返回 `accepted`；`include_reversed=true` 返回全部；两者同时给出返回 400；`status` 与其余过滤条件为逻辑与。返回 `{"items":[...],"next_cursor":...}`，每条字段与按标识读取一致（含 `status`）；按创建时间升序、相同则按标识升序排序，顺序不受插入先后与重复查询影响。结果数超过当前页上限时返回不透明 `next_cursor` 续取，否则为 `null`；游标指向上页末条在该排序中的位置，在含冲正单据的结果集上同样不重复不漏项，任意页序并集恰等于完整结果集。检索按租户隔离，空结果返回空列表 `items` 且 `next_cursor` 为 `null`；租户头缺失或参数不合法（含 `status` 非法、`include_reversed` 非布尔、`status` 与 `include_reversed` 同传）返回 400/422，游标非法返回 400。
 - `GET /stock-movements/{movement_id}/events`：按标识返回该出入库单的变更留痕（只读）。租户经 `X-Tenant` 隔离；单据不存在或跨租户按不存在处理返回 404（不泄漏存在性）；租户头缺失返回 400。留痕在受理与撤销生效的同一事务内原子写入：受理成功留下一条 `accept` 留痕（含受理时的方向、数量，发生时间即单据创建时间），撤销成功留下一条 `reverse` 留痕（含撤销时刻，并保留受理时的方向、数量）；失败、被拒绝（404/409）或幂等重放（含服务重启后的重放）不产生新留痕，不同指纹并发作用于同一单据时未生效的一方不留痕。返回留痕列表（JSON 数组），按发生时间升序、相同则按留痕序号升序排列；序号 `seq` 在同一单据内从 1 起连续递增（受理恒为 1、撤销若发生恒为 2），一经写入不再变化。每条字段：`occurred_at`（发生时间）、`operation`（`accept`/`reverse`）、`status`（操作后的单据状态 `accepted`/`reversed`）、`seq`、`direction` 与 `quantity`（受理时的方向与数量，撤销留痕同样保留）。每张单据至多一条受理留痕与一条撤销留痕，任意受理、撤销、重放、并发与重启序列后，留痕条数与操作实际生效次数一致。查询只读，不改变任何单据、任务与订单数据，与单据检索、数量汇总各自独立、互不影响。
 - `GET /stock-movements/summary`：按订单聚合本租户出入库单的数量汇总（只读）。查询参数 `order_id`（可选，指定单个订单标识，仅在该订单存在出入库单时返回该订单的一条汇总）、`limit`（可选，每页订单数上限，默认 100、最大 500，须为正整数）与 `cursor`（可选，续页游标）。`order_id` 不传时汇总本租户全部有出入库单的订单，按订单标识升序稳定排序，顺序不受插入先后与重复查询影响。返回 `{"items":[{"order_id":...,"net_quantity":...}],"next_cursor":...}`：`net_quantity` 为净出入数量 = 该订单已受理入库数量和 − 已受理出库数量和，冲正（`reversed`）单据计 0（无论原方向）。结果数超过当页 `limit` 时返回不透明 `next_cursor` 续取，否则为 `null`；游标指向上页末条订单标识的位置，页内严格按订单标识大于该位置续取，任意分页大小与任意取页顺序下各页并集恰等于完整结果集，不重复不漏项。空结果返回空 `items` 且 `next_cursor` 为 `null`；租户头缺失、`limit` 非法或游标非法返回 400/422；`order_id` 指定的订单没有出入库单时返回 400，与订单不存在不可区分（不泄漏该订单是否存在）。汇总口径与单据操作一致：受理、撤销（冲正）与重放后，同一订单的净数量恒等于该订单全部单据逐张按状态计入的结果；汇总为只读查询，不改变订单、出入库单、退款、结算单、对账批次、工单与批量导入任务的状态、金额与结论。
+- `GET /stock-movements/monthly-summary`：按月聚合本租户出入库单的数量汇总（只读）。查询参数 `order_id`（可选，仅汇总该订单）、`limit`（可选，每页上限，默认 100、最大 500，须为正整数）与 `cursor`（可选，续页游标）。每条汇总为 `{"order_id":...,"month":"YYYY-MM","net_quantity":...}`：月归属按单据创建时间（ISO，UTC）的年月划分，一经受理不再变化；`net_quantity` 为该订单该月净出入数量 = 当月已受理入库数量和 − 已受理出库数量和，冲正（`reversed`）单据计 0；同一订单跨多月时逐月各出一条。指定 `order_id` 时仅在该订单存在出入库单时返回，否则返回 400，与订单不存在不可区分（不泄漏存在性）；不指定时汇总本租户全部有出入库单的（订单, 月份）条目。返回 `{"items":[...],"next_cursor":...}`：条目按订单标识升序、同订单按月份升序稳定排序，不受插入先后与重复查询影响；游标指向上页末条（订单标识, 月份）位置，页内严格大于该位置续取，任意分页大小与任意取页顺序下各页并集恰等于完整结果集，不重复不漏项；结果数超过当页 `limit` 才返回不透明 `next_cursor`，否则（含空结果）为 `null`。空结果返回空 `items`；租户头缺失、`limit` 非法或游标非法返回 400/422；不提供时间区间筛选。汇总口径与单据操作一致：受理、撤销与重放后，同一订单同一月份的净数量恒等于该月全部单据逐张按状态计入的结果，各月净数量之和恒等于按订单汇总（`GET /stock-movements/summary`）的净数量；同一指纹重放不产生第二次计入。月度汇总为只读查询，与单据检索、按订单汇总、操作留痕各自独立互不影响，不改变任何单据与任务的状态、金额与结论。
 
 ### 工单与对账未结清说明
 
@@ -203,6 +204,13 @@ curl -s 'localhost:8000/stock-movements/summary?order_id=o1' -H 'X-Tenant: t1'
 # 汇总本租户全部有出入库单的订单（按订单标识升序，可用 limit/cursor 分页）
 curl -s 'localhost:8000/stock-movements/summary?limit=100' -H 'X-Tenant: t1'
 curl -s 'localhost:8000/stock-movements/summary?limit=100&cursor=<上一页next_cursor>' -H 'X-Tenant: t1'
+
+# 按月核对某订单的净出入数量（月归属按单据创建时间的 UTC 年月，每条为 order_id/month/net_quantity）
+curl -s 'localhost:8000/stock-movements/monthly-summary?order_id=o1' -H 'X-Tenant: t1'
+
+# 汇总本租户全部（订单, 月份）条目（按订单标识升序、同订单按月份升序，可用 limit/cursor 分页）
+curl -s 'localhost:8000/stock-movements/monthly-summary?limit=100' -H 'X-Tenant: t1'
+curl -s 'localhost:8000/stock-movements/monthly-summary?limit=100&cursor=<上一页next_cursor>' -H 'X-Tenant: t1'
 ```
 - `GET /health`：返回服务与数据库状态。
 

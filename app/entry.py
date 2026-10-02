@@ -299,6 +299,25 @@ def summarize_stock_movements(
         raise HTTPException(status_code=400,
                             detail="order has no stock movement summary")
 
+@app.get("/stock-movements/monthly-summary")
+def summarize_stock_movements_monthly(
+    x_tenant: str = Header(default=""),
+    order_id: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=stock_movements.DEFAULT_PAGE_LIMIT, ge=1,
+                       le=stock_movements.MAX_PAGE_LIMIT),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        return stock_movements.monthly_summary(x_tenant, order_id=order_id,
+                                               cursor=cursor, limit=limit)
+    except stock_movements.InvalidCursor:
+        raise HTTPException(status_code=400, detail="cursor is invalid")
+    except stock_movements.OrderSummaryNotFound:
+        raise HTTPException(status_code=400,
+                            detail="order has no stock movement summary")
+
 @app.get("/stock-movements/{movement_id}")
 def read_stock_movement(movement_id: str, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:
