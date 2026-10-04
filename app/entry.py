@@ -57,6 +57,10 @@ class StockMovementIn(BaseModel):
     direction: Literal["in", "out"]
     quantity: StrictInt = Field(gt=0)
 
+class StockMovementBatchReverseIn(BaseModel):
+    batch_id: str = Field(min_length=1)
+    movement_ids: list[str] = Field(min_length=1)
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -407,6 +411,21 @@ def reverse_stock_movement(movement_id: str, x_tenant: str = Header(default=""),
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="idempotency-key header is required")
     outcome = stock_movements.reverse(x_tenant, movement_id, idempotency_key)
+    return _render(outcome)
+
+@app.post("/stock-movements/batch-reverse", status_code=200)
+def reverse_stock_movements_batch(body: StockMovementBatchReverseIn,
+                                  x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if not body.batch_id.strip():
+        raise HTTPException(status_code=400, detail="batch id must be non-empty")
+    if any(not movement_id.strip() for movement_id in body.movement_ids):
+        raise HTTPException(status_code=400, detail="movement ids must be non-empty")
+    if len(set(body.movement_ids)) != len(body.movement_ids):
+        raise HTTPException(status_code=400,
+                            detail="movement ids must not contain duplicates")
+    outcome = stock_movements.reverse_batch(x_tenant, body.batch_id, body.movement_ids)
     return _render(outcome)
 
 @app.get("/stock-movements")

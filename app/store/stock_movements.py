@@ -26,9 +26,11 @@ STATUSES = (ACCEPTED, REVERSED)
 NOT_FOUND = "not_found"
 CONFLICT = "conflict"
 INVALID_PARAM = "invalid_param"
+WRITER_BUSY = "concurrent_write"
 
 ACCEPT_OP = "stock_movement_accept"
 REVERSE_OP = "stock_movement_reverse"
+BATCH_REVERSE_OP = "stock_movement_batch_reverse"
 
 # Event-stream operation labels (the public audit trail uses English tokens,
 # the same convention as status/direction).
@@ -229,6 +231,108 @@ def reverse(tenant: str, movement_id: str, fingerprint: str) -> Outcome:
             "created_at": row["created_at"],
         }
         store_outcome(conn, tenant=tenant, operation=REVERSE_OP, target_id=movement_id,
+                      fingerprint=fingerprint, code="ok", status=200, detail="",
+                      body=body)
+        conn.execute("COMMIT")
+        return Outcome.ok(body)
+    finally:
+        conn.close()
+
+
+def reverse_batch(tenant: str, batch_id: str, movement_ids: list[str]) -> Outcome:
+    """Reverse a set of accepted stock movements atomically as one batch.
+
+    The batch is identified by (tenant, batch_id) alone — no Idempotency-Key:
+    the canonical fingerprint is the sorted movement-id set itself, so the
+    same set submitted again in any order replays the recorded first result
+    (including a recorded 404/409) even after a restart or later state
+    changes, while the same batch id with a different set conflicts (409)
+    without overwriting the first record. The batch id never occupies a
+    movement id and does not interact with single-movement reversal keys.
+
+    All movements must belong to the tenant and be ``accepted``; then — and
+    only then — one transaction flips every movement to ``reversed``
+    (direction/quantity/created_at preserved) and appends one reverse event
+    per movement. A missing or cross-tenant movement fails the whole batch
+    with 404 (no existence leak) and takes precedence over an
+    already-reversed movement (409); either failure changes nothing and
+    appends no events. The connection uses a zero lock timeout: if a
+    concurrent write holds the write lock, the batch fails before starting
+    with a distinguishable retryable 409 that is not recorded, so the batch
+    id stays free for the retry.
+    """
+    fingerprint = json.dumps(sorted(set(movement_ids)), ensure_ascii=False)
+    conn = connect(timeout=0)
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            if "lock" in str(error).lower():
+                return Outcome(WRITER_BUSY, 409,
+                               "a concurrent write is in progress; retry the batch reversal", {})
+            raise
+
+        replay = lookup_replay(conn, tenant, BATCH_REVERSE_OP, batch_id, fingerprint)
+        if replay is not None:
+            conn.execute("COMMIT")
+            return replay
+
+        used = conn.execute(
+            "SELECT 1 FROM idempotent_requests "
+            "WHERE tenant=? AND operation=? AND target_id=? LIMIT 1",
+            (tenant, BATCH_REVERSE_OP, batch_id),
+        ).fetchone()
+        if used is not None:
+            conn.execute("ROLLBACK")
+            return Outcome(CONFLICT, 409,
+                           "batch id already used with a different movement set", {})
+
+        wanted = sorted(set(movement_ids))
+        rows: dict[str, sqlite3.Row] = {}
+        for movement_id in wanted:
+            row = conn.execute(
+                f"{_SELECT} WHERE tenant=? AND movement_id=?",
+                (tenant, movement_id),
+            ).fetchone()
+            if row is not None:
+                rows[movement_id] = row
+
+        if len(rows) < len(wanted):
+            return record_and_finish(
+                conn, tenant=tenant, operation=BATCH_REVERSE_OP, target_id=batch_id,
+                fingerprint=fingerprint, status=404, code=NOT_FOUND,
+                detail="stock movement not found",
+            )
+
+        if any(row["status"] == REVERSED for row in rows.values()):
+            return record_and_finish(
+                conn, tenant=tenant, operation=BATCH_REVERSE_OP, target_id=batch_id,
+                fingerprint=fingerprint, status=409, code=CONFLICT,
+                detail="stock movement already reversed",
+            )
+
+        occurred_at = now_iso()
+        items = []
+        for movement_id in wanted:
+            row = rows[movement_id]
+            conn.execute(
+                "UPDATE stock_movements SET status=? WHERE tenant=? AND movement_id=?",
+                (REVERSED, tenant, movement_id),
+            )
+            _append_event(conn, tenant=tenant, movement_id=movement_id,
+                          operation=REVERSE_EVENT, status=REVERSED,
+                          direction=row["direction"], quantity=row["quantity"],
+                          occurred_at=occurred_at)
+            items.append({
+                "movement_id": movement_id,
+                "order_id": row["order_id"],
+                "direction": row["direction"],
+                "quantity": row["quantity"],
+                "status": REVERSED,
+                "created_at": row["created_at"],
+            })
+        body = {"batch_id": batch_id, "items": items}
+        store_outcome(conn, tenant=tenant, operation=BATCH_REVERSE_OP, target_id=batch_id,
                       fingerprint=fingerprint, code="ok", status=200, detail="",
                       body=body)
         conn.execute("COMMIT")
