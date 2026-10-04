@@ -57,6 +57,14 @@ class StockMovementIn(BaseModel):
     direction: Literal["in", "out"]
     quantity: StrictInt = Field(gt=0)
 
+
+class StockMovementBatchReverseIn(BaseModel):
+    # Kept permissive on purpose: missing fields, an empty set and duplicate
+    # ids are all one parameter-error family (400), checked in the route so
+    # they share one status and never reach the store.
+    batch_id: str | None = None
+    movement_ids: list[str] | None = None
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -407,6 +415,32 @@ def reverse_stock_movement(movement_id: str, x_tenant: str = Header(default=""),
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="idempotency-key header is required")
     outcome = stock_movements.reverse(x_tenant, movement_id, idempotency_key)
+    return _render(outcome)
+
+@app.post("/stock-movements/batch-reversals", status_code=200)
+def batch_reverse_stock_movements(body: StockMovementBatchReverseIn,
+                                  x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    # One parameter-error family for a missing/blank batch id, a missing/empty
+    # id set, blank ids or duplicated ids — none of them writes anything or
+    # consumes the batch id. The batch carries no Idempotency-Key: the batch id
+    # itself is the durable request identity.
+    if not body.batch_id or not body.batch_id.strip():
+        raise HTTPException(status_code=400, detail="batch_id is required")
+    if not body.movement_ids:
+        raise HTTPException(status_code=400, detail="movement_ids must be a non-empty list")
+    if any(not isinstance(mid, str) or not mid for mid in body.movement_ids):
+        raise HTTPException(status_code=400, detail="movement_ids must contain non-empty ids")
+    if len(set(body.movement_ids)) != len(body.movement_ids):
+        raise HTTPException(status_code=400, detail="movement_ids must not contain duplicates")
+    try:
+        outcome = stock_movements.batch_reverse(x_tenant, body.batch_id, body.movement_ids)
+    except stock_movements.BatchRetryableConflict:
+        # Distinguishable from the business 409: processing never started, so
+        # the batch id was not consumed and the same request may be retried.
+        raise HTTPException(status_code=503,
+                            detail="batch reversal could not start due to write contention; retry")
     return _render(outcome)
 
 @app.get("/stock-movements")

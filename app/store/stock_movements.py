@@ -4,7 +4,7 @@ import sqlite3
 
 from app.store.db import connect
 from app.store.idempotency import lookup_replay, now_iso, record_and_finish, store_outcome
-from app.store.outcome import Outcome
+from app.store.outcome import Outcome, deserialize, serialize
 
 # Stock movements are immutable records of inbound (in) / outbound (out)
 # quantities against an accepted order. They act only on themselves: accepting,
@@ -37,6 +37,19 @@ REVERSE_EVENT = "reverse"
 
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 500
+
+# Batch reversal operation labels and the distinguishable retryable-conflict
+# answer returned only when write contention prevents a batch from starting.
+BATCH_REVERSE_OP = "stock_movement_batch_reverse"
+RETRYABLE_CONFLICT = "retryable_conflict"
+
+
+class BatchRetryableConflict(Exception):
+    """The write lock could not be acquired to start processing the batch.
+
+    Raised only when the request never entered business validation, so no
+    batch record exists and the batch id remains free to retry.
+    """
 
 
 class InvalidCursor(Exception):
@@ -233,6 +246,122 @@ def reverse(tenant: str, movement_id: str, fingerprint: str) -> Outcome:
                       body=body)
         conn.execute("COMMIT")
         return Outcome.ok(body)
+    finally:
+        conn.close()
+
+
+def _store_batch_outcome(conn: sqlite3.Connection, *, tenant: str, batch_id: str,
+                         ids_key: str, outcome: Outcome) -> None:
+    """Persist a batch's first outcome (success or recorded 404/409)."""
+    conn.execute(
+        "INSERT INTO stock_movement_reversal_batches(tenant, batch_id, movement_ids, "
+        "result_code, result_status, result_detail, result_body, created_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (tenant, batch_id, ids_key, outcome.code, outcome.status, outcome.detail,
+         serialize(outcome.body, outcome.status, outcome.detail), now_iso()),
+    )
+
+
+def _replay_batch(row: sqlite3.Row) -> Outcome:
+    status, detail, body = deserialize(row["result_body"])
+    return Outcome(row["result_code"], status, detail, body if body is not None else {})
+
+
+def batch_reverse(tenant: str, batch_id: str, movement_ids: list[str]) -> Outcome:
+    """Reverse a set of accepted movements from one mistaken registration, atomically.
+
+    Either every listed movement flips accepted -> reversed in one transaction
+    (each keeping direction/quantity/created_at and gaining one reverse event)
+    or nothing changes at all. The batch is durably identified by
+    (tenant, batch_id): the first legal request persists its canonical
+    (sorted, deduplicated) id set together with its business result, and every
+    later request with the same id set — reordered, after restart, or after the
+    movements changed — replays that first result, including a first-time
+    404/409. The same batch id with a different id set conflicts (409) without
+    overwriting the record; a failed batch needs a fresh batch id.
+
+    Error precedence: if any id is missing for this tenant (including an id
+    that exists under another tenant — existence is never leaked), the whole
+    batch answers 404; otherwise if any movement is already reversed, it
+    answers 409. A single movement can actually reverse at most once, no
+    matter how single reversals and batches interleave concurrently: losing
+    batches fail whole with 409 and leave no partial state, events or success
+    record. ``BatchRetryableConflict`` is raised only when write contention
+    stops processing from starting, which never consumes the batch id.
+    """
+    ids_key = json.dumps(sorted(set(movement_ids)), separators=(",", ":"))
+
+    conn = connect()
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            if "locked" in str(error).lower() or "busy" in str(error).lower():
+                raise BatchRetryableConflict(str(error)) from error
+            raise
+
+        recorded = conn.execute(
+            "SELECT result_code, result_status, result_detail, result_body, movement_ids "
+            "FROM stock_movement_reversal_batches WHERE tenant=? AND batch_id=?",
+            (tenant, batch_id),
+        ).fetchone()
+        if recorded is not None:
+            outcome = _replay_batch(recorded)
+            if recorded["movement_ids"] != ids_key:
+                conn.execute("COMMIT")
+                return Outcome(CONFLICT, 409,
+                               "reversal batch was already submitted with a different movement set",
+                               {})
+            conn.execute("COMMIT")
+            return outcome
+
+        # Fetch in the canonical order; the response list is sorted by id.
+        rows = conn.execute(
+            f"{_SELECT} WHERE tenant=? AND movement_id IN ({','.join('?' for _ in movement_ids)}) "
+            "ORDER BY movement_id ASC",
+            (tenant, *movement_ids),
+        ).fetchall() if movement_ids else []
+
+        if len({r["movement_id"] for r in rows}) != len(set(movement_ids)):
+            outcome = Outcome(NOT_FOUND, 404, "stock movement not found", {})
+            _store_batch_outcome(conn, tenant=tenant, batch_id=batch_id,
+                                 ids_key=ids_key, outcome=outcome)
+            conn.execute("COMMIT")
+            return outcome
+
+        if any(r["status"] == REVERSED for r in rows):
+            outcome = Outcome(CONFLICT, 409, "stock movement already reversed", {})
+            _store_batch_outcome(conn, tenant=tenant, batch_id=batch_id,
+                                 ids_key=ids_key, outcome=outcome)
+            conn.execute("COMMIT")
+            return outcome
+
+        reversed_at = now_iso()
+        results: list[dict] = []
+        for row in rows:
+            conn.execute(
+                "UPDATE stock_movements SET status=? WHERE tenant=? AND movement_id=? AND status=?",
+                (REVERSED, tenant, row["movement_id"], ACCEPTED),
+            )
+            _append_event(conn, tenant=tenant, movement_id=row["movement_id"],
+                          operation=REVERSE_EVENT, status=REVERSED,
+                          direction=row["direction"], quantity=row["quantity"],
+                          occurred_at=reversed_at)
+            results.append({
+                "movement_id": row["movement_id"],
+                "order_id": row["order_id"],
+                "direction": row["direction"],
+                "quantity": row["quantity"],
+                "status": REVERSED,
+                "created_at": row["created_at"],
+            })
+
+        body = {"batch_id": batch_id, "results": results}
+        outcome = Outcome.ok(body)
+        _store_batch_outcome(conn, tenant=tenant, batch_id=batch_id,
+                             ids_key=ids_key, outcome=outcome)
+        conn.execute("COMMIT")
+        return outcome
     finally:
         conn.close()
 
